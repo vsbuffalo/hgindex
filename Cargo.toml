@@ -1,0 +1,10 @@
+[package]
+name = "hgindex"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+indexmap = "2.7.0"
+thiserror = "2.0.8"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
