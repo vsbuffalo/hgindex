@@ -101,6 +101,7 @@ pub fn calc_offsets_from_levels(levels: &[u32]) -> Vec<u32> {
 
 /// Calculate the bin offsets, from level 0 to level nlevels, shifting next_shift
 /// each level.
+#[allow(dead_code)]
 pub fn calc_offsets(next_shift: u32, nlevels: usize) -> Vec<u32> {
     let level_bins = calc_level_sizes(next_shift, nlevels);
     calc_offsets_from_levels(&level_bins)
@@ -146,9 +147,8 @@ impl HierarchicalBins {
         end_bin >>= self.base_shift;
 
         // Check each level
-        for (i, &offset) in self.bin_offsets.iter().enumerate() {
+        for (_i, &offset) in self.bin_offsets.iter().enumerate() {
             if start_bin == end_bin {
-                dbg!(start, end, offset + start_bin);
                 return offset + start_bin;
             }
             start_bin >>= self.level_shift;
@@ -170,7 +170,7 @@ impl HierarchicalBins {
         end_bin >>= self.base_shift;
 
         // For each level
-        for (level, &offset) in self.bin_offsets.iter().enumerate() {
+        for (_level, &offset) in self.bin_offsets.iter().enumerate() {
             // Calculate all bins for this level between start and end
             let level_start = start_bin;
             let level_end = end_bin;
