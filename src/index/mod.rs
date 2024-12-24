@@ -1,7 +1,6 @@
 // index/mod.rs
 mod binning;
-mod index;
+mod binning_index;
 
 pub use binning::HierarchicalBins;
-pub use index::{BinningIndex, Feature, SequenceIndex};
-
+pub use binning_index::{BinningIndex, Feature, SequenceIndex};

@@ -24,10 +24,10 @@
 /// shift with the bin level's width exponent$). So, for example,
 ///
 ///   >>> 100_000_000 >> 17   # start range right shifted with level 0 (128kb bins)
-///   762                     # this is the first bin index
+/// > > > 762                     # this is the first bin index
 ///
 ///   >>> 100_191_121 >> 17   # end range right shifted with level 0
-///   764                     # this is the last bin index.
+/// > > > 764                     # this is the last bin index.
 ///
 /// The query range needs to be checked against *all levels*. If a query range is larger, it will
 /// need to be checked against many of the smaller windows. This increases *total bin access* time,
@@ -147,7 +147,7 @@ impl HierarchicalBins {
         end_bin >>= self.base_shift;
 
         // Check each level
-        for (_i, &offset) in self.bin_offsets.iter().enumerate() {
+        for &offset in self.bin_offsets.iter() {
             if start_bin == end_bin {
                 return offset + start_bin;
             }
@@ -170,7 +170,7 @@ impl HierarchicalBins {
         end_bin >>= self.base_shift;
 
         // For each level
-        for (_level, &offset) in self.bin_offsets.iter().enumerate() {
+        for &offset in self.bin_offsets.iter() {
             // Calculate all bins for this level between start and end
             let level_start = start_bin;
             let level_end = end_bin;
@@ -312,7 +312,7 @@ mod tests {
 
         // Test small range within a single smallest bin
         let bins = index.region_to_bins(1000, 2000);
-        assert!(bins.contains(&(585 + 0))); // Should contain the level 4 bin
+        assert!(bins.contains(&585)); // Should contain the level 4 bin
 
         // Test range spanning multiple smallest bins
         //let bins = index.region_to_bins(128_000, 256_000);

@@ -154,7 +154,7 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
         })
     }
 
-    fn open_chrom_file(&mut self, chrom: &str) -> std::io::Result<()> {
+    pub fn open_chrom_file(&mut self, chrom: &str) -> std::io::Result<()> {
         if !self.data_files.contains_key(chrom) {
             let data_path = self.get_data_path(chrom);
             let mut file = File::open(&data_path)?;
@@ -184,7 +184,7 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
         }
 
         // Open chromosome file if not already open
-        if let Err(_) = self.open_chrom_file(chrom) {
+        if self.open_chrom_file(chrom).is_err() {
             return results;
         }
 

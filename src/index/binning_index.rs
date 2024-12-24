@@ -1,4 +1,4 @@
-// index.rs
+// binning_index.rs
 
 use std::{
     fs::File,
@@ -68,6 +68,12 @@ pub struct Feature {
     index: u64,
 }
 
+impl<M: SerdeType> Default for BinningIndex<M> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<M: SerdeType> BinningIndex<M> {
     pub fn new() -> Self {
         BinningIndex {
@@ -94,20 +100,13 @@ impl<M: SerdeType> BinningIndex<M> {
         let bin_id = binning.region_to_bin(start, end);
 
         // the chromosome-level index
-        let bin_index = self
-            .sequences
-            .entry(chrom.to_string())
-            .or_insert_with(SequenceIndex::new);
+        let bin_index = self.sequences.entry(chrom.to_string()).or_default();
 
         // make the feature
         let feature = Feature { start, end, index };
 
         // insert the feature
-        bin_index
-            .bins
-            .entry(bin_id)
-            .or_insert_with(Vec::new)
-            .push(feature);
+        bin_index.bins.entry(bin_id).or_default().push(feature);
 
         // Update linear index
         let linear_idx = start >> 14; // 16kb chunks (2^14)
@@ -164,6 +163,12 @@ impl<M: SerdeType> BinningIndex<M> {
     }
 }
 
+impl Default for SequenceIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SequenceIndex {
     pub fn new() -> Self {
         SequenceIndex {
@@ -186,7 +191,7 @@ mod tests {
         index.add_feature("chr1", 1000, 2000, 100);
         index.add_feature("chr1", 1500, 2500, 200);
         index.add_feature("chr1", 5000, 6000, 300);
-        return index;
+        index
     }
 
     #[test]
