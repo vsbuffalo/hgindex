@@ -372,4 +372,89 @@ mod tests {
             .expect("Failed to open store");
         assert_eq!(reopened.metadata(), None);
     }
+
+    // A minimal test record
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct MinimalTestRecord {
+        score: f64,
+    }
+
+    #[test]
+    fn test_zero_length_features() {
+        let test_dir = TestDir::new("zero_length").expect("Failed to create test dir");
+        let store_path = test_dir.path().join("test.gidx");
+        let mut store = GenomicDataStore::<MinimalTestRecord, ()>::create(&store_path, None)
+            .expect("Failed to create store");
+
+        // Test zero-length feature
+        store
+            .add_record("chr1", 1000, 1000, &MinimalTestRecord { score: 1.2 })
+            .expect("Failed to add zero-length record");
+
+        // Test position 0
+        store
+            .add_record("chr1", 0, 100, &MinimalTestRecord { score: 2.3 })
+            .expect("Failed to add record at position 0");
+    }
+
+    #[test]
+    fn test_concurrent_reads() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let test_dir = TestDir::new("concurrent").expect("Failed to create test dir");
+        let store_path = test_dir.path().join("test.gidx");
+
+        // Create and populate store
+        {
+            let mut store = GenomicDataStore::<MinimalTestRecord, ()>::create(&store_path, None)
+                .expect("Failed to create store");
+
+            // Add some overlapping records
+            for i in 0..10 {
+                store
+                    .add_record(
+                        "chr1",
+                        i * 1000,
+                        (i + 2) * 1000, // Overlapping regions
+                        &MinimalTestRecord { score: i as f64 },
+                    )
+                    .expect("Failed to add record");
+            }
+            store.finalize().expect("Failed to finalize");
+        }
+
+        // Create path that can be shared between threads
+        let path = Arc::new(store_path);
+
+        // Spawn multiple reader threads
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let path = Arc::clone(&path);
+                thread::spawn(move || {
+                    let mut store = GenomicDataStore::<MinimalTestRecord, ()>::open(&path, None)
+                        .expect("Failed to open store");
+
+                    // Each thread queries a different but overlapping region
+                    let start = i * 500;
+                    let end = start + 2000;
+                    let results = store.get_overlapping("chr1", start, end);
+
+                    // Results should not be empty due to overlapping regions
+                    assert!(!results.is_empty());
+                    results.len()
+                })
+            })
+            .collect();
+
+        // Verify all threads completed successfully
+        let result_counts: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("Thread panicked"))
+            .collect();
+
+        // Verify that at least some threads got different numbers of results
+        // due to querying different regions
+        assert!(result_counts.iter().any(|&x| x != result_counts[0]));
+    }
 }
