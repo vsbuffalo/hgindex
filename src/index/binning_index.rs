@@ -6,7 +6,7 @@ use std::{
     path::Path,
 };
 
-use crate::SerdeType;
+use crate::{error::HgIndexError, SerdeType};
 
 use super::binning::HierarchicalBins;
 use indexmap::IndexMap;
@@ -95,7 +95,16 @@ impl<M: SerdeType> BinningIndex<M> {
     }
 
     /// Add a feature, a range with a file
-    pub fn add_feature(&mut self, chrom: &str, start: u32, end: u32, index: u64) {
+    pub fn add_feature(
+        &mut self,
+        chrom: &str,
+        start: u32,
+        end: u32,
+        index: u64,
+    ) -> Result<(), HgIndexError> {
+        if start >= end {
+            return Err(HgIndexError::InvalidInterval { start, end });
+        }
         let binning = HierarchicalBins::default();
         let bin_id = binning.region_to_bin(start, end);
 
@@ -109,7 +118,7 @@ impl<M: SerdeType> BinningIndex<M> {
         bin_index.bins.entry(bin_id).or_default().push(feature);
 
         // Update linear index
-        let linear_idx = start >> 14; // 16kb chunks (2^14)
+        let linear_idx = start >> binning.linear_shift;
         if linear_idx >= bin_index.linear_index.len() as u32 {
             bin_index
                 .linear_index
@@ -117,6 +126,7 @@ impl<M: SerdeType> BinningIndex<M> {
         }
         bin_index.linear_index[linear_idx as usize] =
             bin_index.linear_index[linear_idx as usize].min(index);
+        Ok(())
     }
 
     /// Return the indices (e.g. file offsets) of all ranges that overlap with the supplied range.
@@ -127,12 +137,10 @@ impl<M: SerdeType> BinningIndex<M> {
 
         let binning = HierarchicalBins::default();
         let bins_to_check = binning.region_to_bins(start, end);
-
         let mut overlapping = Vec::new();
 
-        // Use linear index to find minimum file offset to start checking
         let min_offset = {
-            let linear_idx = start >> 14;
+            let linear_idx = start >> binning.linear_shift;
             if linear_idx < chrom_index.linear_index.len() as u32 {
                 chrom_index.linear_index[linear_idx as usize]
             } else {
@@ -150,15 +158,14 @@ impl<M: SerdeType> BinningIndex<M> {
             }
         }
 
-        overlapping.sort_unstable();
-        overlapping.dedup();
         overlapping
     }
 
     /// Write the BinningIndex to a path by binary serialization.
-    pub fn write(&self, path: &Path) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    pub fn write(&self, path: &Path) -> Result<(), HgIndexError> {
         let mut file = BufWriter::new(File::create(path)?);
-        bincode::serialize_into(&mut file, &self)?;
+        bincode::serialize_into(&mut file, &self)
+            .map_err(|e| HgIndexError::SerializationError(e.to_string()))?;
         Ok(())
     }
 }
@@ -188,9 +195,9 @@ mod tests {
         let mut index = BinningIndex::new();
 
         // Add some features with the indices
-        index.add_feature("chr1", 1000, 2000, 100);
-        index.add_feature("chr1", 1500, 2500, 200);
-        index.add_feature("chr1", 5000, 6000, 300);
+        index.add_feature("chr1", 1000, 2000, 100).unwrap();
+        index.add_feature("chr1", 1500, 2500, 200).unwrap();
+        index.add_feature("chr1", 5000, 6000, 300).unwrap();
         index
     }
 
@@ -221,5 +228,151 @@ mod tests {
         // read the index into new object
         let obj = BinningIndex::open(&index_file).expect("Error reading index");
         assert_eq!(index, obj);
+    }
+
+    #[test]
+    fn test_edge_case_binning() {
+        let mut index = BinningIndex::<()>::new();
+        // Add features testing various edge cases
+        index.add_feature("chr1", 1000, 1001, 100).unwrap(); // 1-base instead of zero-length
+        index.add_feature("chr1", 2000, 2001, 200).unwrap(); // 1-base
+        index.add_feature("chr1", 3000, 3100, 300).unwrap(); // regular feature
+        index.add_feature("chr1", 4000, 4001, 400).unwrap(); // 1-base instead of zero-length
+
+        // Test one-base length queries
+        let overlaps = index.find_overlapping("chr1", 1000, 1001);
+        assert_eq!(overlaps.len(), 1);
+        assert!(overlaps.contains(&100));
+
+        // Test exact boundary matches
+        let overlaps = index.find_overlapping("chr1", 2000, 2001);
+        assert_eq!(overlaps.len(), 1);
+        assert!(overlaps.contains(&200));
+
+        // No overlaps here, since 2001 of the range is right exclusive
+        let overlaps = index.find_overlapping("chr1", 2001, 2002);
+        assert_eq!(overlaps.len(), 0);
+
+        // Test regular overlaps
+        let overlaps = index.find_overlapping("chr1", 3050, 3075);
+        assert_eq!(overlaps.len(), 1);
+        assert!(overlaps.contains(&300));
+
+        // Test boundary overlaps
+        let overlaps = index.find_overlapping("chr1", 3000, 3001);
+        assert_eq!(overlaps.len(), 1);
+        assert!(overlaps.contains(&300));
+
+        let overlaps = index.find_overlapping("chr1", 3099, 3100);
+        assert_eq!(overlaps.len(), 1);
+        assert!(overlaps.contains(&300));
+    }
+
+    #[test]
+    fn test_invalid_intervals() {
+        let mut index = BinningIndex::<()>::new();
+
+        // Test zero-width intervals
+        let err = index.add_feature("chr1", 1000, 1000, 100).unwrap_err();
+        assert!(matches!(
+            err,
+            HgIndexError::InvalidInterval {
+                start: 1000,
+                end: 1000
+            }
+        ));
+
+        // Test where end < start
+        let err = index.add_feature("chr1", 2000, 1999, 200).unwrap_err();
+        assert!(matches!(
+            err,
+            HgIndexError::InvalidInterval {
+                start: 2000,
+                end: 1999
+            }
+        ));
+
+        // Test boundary case where start is max value
+        let err = index
+            .add_feature("chr1", u32::MAX, u32::MAX, 300)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            HgIndexError::InvalidInterval {
+                start: u32::MAX,
+                end: u32::MAX
+            }
+        ));
+
+        // Valid intervals should work
+        assert!(index.add_feature("chr1", 1000, 1001, 100).is_ok()); // Minimum valid interval (1bp)
+        assert!(index.add_feature("chr1", 0, 1, 200).is_ok()); // Valid at zero
+        assert!(index.add_feature("chr1", 1000, 2000, 300).is_ok()); // Larger interval
+    }
+
+    //#[test]
+    //fn test_bin_boundary_overlaps() {
+    //    let mut index = BinningIndex::<()>::new();
+    //    let binning = HierarchicalBins::default();
+    //    let bin_size = 1 << binning.base_shift; // 128kb bin size
+
+    //    // Add feature that spans bin boundary
+    //    // If bin_size is 128kb (131072), this creates a feature spanning:
+    //    // [131071, 131073) - which crosses from bin 0 to bin 1
+    //    index.add_feature("chr1", bin_size - 1, bin_size + 1, 100);
+
+    //    // Test overlap on left side of boundary
+    //    // [131071, 131072) - should be in bin 0
+    //    let overlaps = index.find_overlapping("chr1", bin_size - 1, bin_size);
+    //    assert_eq!(overlaps.len(), 1);
+    //    assert!(overlaps.contains(&100));
+
+    //    // Test overlap on right side of boundary
+    //    // [131072, 131073) - should be in bin 1
+    //    let overlaps = index.find_overlapping("chr1", bin_size, bin_size + 1);
+    //    assert_eq!(overlaps.len(), 1);
+    //    assert!(overlaps.contains(&100));
+
+    //    // Test overlap spanning boundary
+    //    // [131071, 131073) - should span bins 0 and 1
+    //    let overlaps = index.find_overlapping("chr1", bin_size - 1, bin_size + 1);
+    //    assert_eq!(overlaps.len(), 1);
+    //    assert!(overlaps.contains(&100));
+    //}
+
+    #[test]
+    fn test_bed_coordinate_system() {
+        let mut index = BinningIndex::<()>::new();
+
+        // Create several strategic features
+        index.add_feature("chr1", 10, 20, 1).unwrap(); // [10,20)
+        index.add_feature("chr1", 20, 30, 2).unwrap(); // [20,30) - adjacent to first feature
+        index.add_feature("chr1", 40, 41, 3).unwrap(); // [40,41) - single base feature
+
+        // Test 1: Adjacent features should each overlap a query that spans their boundary
+        let overlaps = index.find_overlapping("chr1", 19, 21);
+        assert_eq!(overlaps.len(), 2); // Should find both features
+
+        // Test 2: Point query exactly at feature boundary should only match feature that starts there
+        let overlaps = index.find_overlapping("chr1", 20, 21);
+        assert_eq!(overlaps.len(), 1); // Should only find second feature
+        assert!(overlaps.contains(&2)); // Should be second feature
+        assert!(!overlaps.contains(&1)); // Should not find first feature
+
+        // Test 3: Point queries around single-base feature
+        let overlaps = index.find_overlapping("chr1", 40, 41);
+        assert_eq!(overlaps.len(), 1); // Should find the feature
+
+        let overlaps = index.find_overlapping("chr1", 41, 42);
+        assert_eq!(overlaps.len(), 0); // Should not find the feature
+
+        // Test 4: One-base query at the end of first feature
+        let overlaps = index.find_overlapping("chr1", 19, 20);
+        assert_eq!(overlaps.len(), 1); // Should find first feature
+        assert!(overlaps.contains(&1));
+
+        // Test 5: Test non-overlapping ranges
+        let overlaps = index.find_overlapping("chr1", 30, 40);
+        assert_eq!(overlaps.len(), 0); // Should find no features
     }
 }

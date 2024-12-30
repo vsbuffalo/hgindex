@@ -11,6 +11,7 @@ serde = { version = "1.0.216", features = ["derive"] }
 thiserror = "2.0.8"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
+zstd = "0.13.2"
 
 [dev-dependencies]
 tempfile = "3.14.0"

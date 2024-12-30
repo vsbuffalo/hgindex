@@ -52,11 +52,18 @@
 
 #[derive(Clone, Debug)]
 pub struct HierarchicalBins {
+    /// For hierarchical bins (17 = 128kb)
     pub base_shift: u32,
+    /// For level scaling (3 = 8x between levels)
     pub level_shift: u32,
+    /// Number of bin levels
     pub num_levels: usize,
+    /// Number of bins at each level
     pub levels: Vec<u32>,
+    /// Offsets for each level
     pub bin_offsets: Vec<u32>,
+    /// For linear index (14 = 16kb)
+    pub linear_shift: u32,
 }
 
 impl Default for HierarchicalBins {
@@ -64,11 +71,12 @@ impl Default for HierarchicalBins {
         let levels = calc_level_sizes(3, 5);
         let bin_offsets = calc_offsets_from_levels(&levels);
         HierarchicalBins {
-            base_shift: 17,
-            level_shift: 3,
+            base_shift: 17, // 128kb bins
+            level_shift: 3, // 8x scaling
             num_levels: 5,
             levels,
             bin_offsets,
+            linear_shift: 14, // 16kb linear bins
         }
     }
 }
@@ -109,7 +117,7 @@ pub fn calc_offsets(next_shift: u32, nlevels: usize) -> Vec<u32> {
 
 impl HierarchicalBins {
     // Create a new binning scheme with custom parameters
-    pub fn new(base_shift: u32, level_shift: u32, num_levels: usize) -> Self {
+    pub fn new(base_shift: u32, level_shift: u32, num_levels: usize, linear_shift: u32) -> Self {
         let levels = calc_level_sizes(level_shift, num_levels);
         let bin_offsets = calc_offsets_from_levels(&levels);
         Self {
@@ -118,29 +126,30 @@ impl HierarchicalBins {
             num_levels,
             levels,
             bin_offsets,
+            linear_shift,
         }
     }
 
     // Create the classic UCSC configuration
     pub fn ucsc() -> Self {
-        Self::new(17, 3, 5) // 128kb base bins, 8x scaling, 5 levels
+        Self::new(17, 3, 5, 14) // 128kb base bins, 8x scaling, 5 levels, 16kb linear bins
     }
 
     // Create a denser binning scheme for higher resolution
     pub fn dense() -> Self {
-        Self::new(14, 2, 6) // 16kb base bins, 4x scaling, 6 levels
+        Self::new(14, 2, 6, 12) // 16kb base bins, 4x scaling, 6 levels, 4kb linear bins
     }
 
     // Create a sparser scheme for large regions
     pub fn sparse() -> Self {
-        Self::new(20, 4, 4) // 1Mb base bins, 16x scaling, 4 levels
+        Self::new(20, 4, 4, 16) // 1Mb base bins, 16x scaling, 4 levels, 64kb linear bins
     }
 
     /// Find the smallest bin that fully contains this range,
     /// [start, end).
     pub fn region_to_bin(&self, start: u32, end: u32) -> u32 {
         let mut start_bin = start;
-        let mut end_bin = end - 1; // Exclusive end, so subtract 1
+        let mut end_bin = end - 1;
 
         // First shift
         start_bin >>= self.base_shift;
@@ -163,7 +172,7 @@ impl HierarchicalBins {
     pub fn region_to_bins(&self, start: u32, end: u32) -> Vec<u32> {
         let mut bins = Vec::new();
         let mut start_bin = start;
-        let mut end_bin = end - 1; // Exclusive end, so subtract 1
+        let mut end_bin = end - 1;
 
         // First shift with the initial shift amount (17 by default)
         start_bin >>= self.base_shift;
@@ -180,11 +189,6 @@ impl HierarchicalBins {
                 bins.push(offset + bin);
             }
 
-            // Early exit if we've reached a level where start and end are in the same bin
-            if start_bin == end_bin {
-                break;
-            }
-
             // Shift to next level (dividing by 8, equivalent to right shift by 3)
             start_bin >>= self.level_shift;
             end_bin >>= self.level_shift;
@@ -194,6 +198,12 @@ impl HierarchicalBins {
     }
 }
 
+// # Developer Notes
+//
+// Some of the tests were generated with Claude (AICODE) by showing it the UCSC
+// browser documentation here (http://genomewiki.ucsc.edu/index.php/Bin_indexing_system)
+// and having it generate test cases.
+//
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,7 +218,7 @@ mod tests {
     #[test]
     fn test_ucsc_offsets() {
         let offsets = calc_offsets(3, 5);
-        dbg!(&offsets);
+        // dbg!(&offsets);
         assert_eq!(offsets, vec![585, 73, 9, 1, 0]);
     }
 
@@ -293,7 +303,6 @@ mod tests {
         assert_eq!(index.region_to_bin(0, 500_000_000), 0); // Level 0 offset + bin number
 
         // Test edge cases
-
         #[allow(non_upper_case_globals)]
         const KiB: u32 = 1024;
 
@@ -306,6 +315,7 @@ mod tests {
         let bin2 = index.region_to_bin(128_000, 256_000);
         assert_ne!(bin1, bin2);
     }
+
     #[test]
     fn test_region_to_bins() {
         let index = HierarchicalBins::default();
@@ -315,24 +325,91 @@ mod tests {
         assert!(bins.contains(&585)); // Should contain the level 4 bin
 
         // Test range spanning multiple smallest bins
-        //let bins = index.region_to_bins(128_000, 256_000);
-        //assert!(bins.contains(&(585 + 1))); // Should contain level 4 bins
-        //assert!(bins.contains(&(585 + 2)));
+        let bins = index.region_to_bins(128_000, 256_000);
+        assert!(bins.contains(&(585 + 1))); // Should contain level 4 bins
 
-        //// Test larger range that requires checking higher level bins
-        //let bins = index.region_to_bins(0, 1_000_000);
-        //// Should contain bins from multiple levels
-        //assert!(bins.contains(&0)); // Level 0 bin
-        //assert!(bins.contains(&1)); // Level 1 bin
-        //assert!(bins.iter().any(|&x| x >= 585)); // Should have some level 4 bins
+        // Test larger range that requires checking higher level bins
+        let bins = index.region_to_bins(0, 1_000_000);
+        // Should contain bins from multiple levels
+        assert!(bins.contains(&0)); // Level 0 bin
+        assert!(bins.contains(&1)); // Level 1 bin
+        assert!(bins.iter().any(|&x| x >= 585)); // Should have some level 4 bins
 
-        //// Test exact bin boundary
-        //let bins = index.region_to_bins(0, 128 * 1024); // Exactly one 128kb bin
-        //assert!(bins.contains(&585)); // Should contain first level 4 bin
+        // Test exact bin boundary
+        let bins = index.region_to_bins(0, 128 * 1024); // Exactly one 128kb bin
+        assert!(bins.contains(&585)); // Should contain first level 4 bin
 
         //// Test that bins are unique
-        //let bins = index.region_to_bins(0, 10_000_000);
-        //let unique_bins: Vec<_> = bins.iter().cloned().collect();
-        //assert_eq!(bins.len(), unique_bins.len());
+        let bins = index.region_to_bins(0, 10_000_000);
+        let unique_bins: Vec<_> = bins.iter().cloned().collect();
+        assert_eq!(bins.len(), unique_bins.len());
+    }
+
+    #[test]
+    fn test_region_to_bins_max_standard_range() {
+        let index = HierarchicalBins::default();
+        // Test range up to 512MB (536,870,912 bytes)
+        let bins = index.region_to_bins(0, 536_870_912);
+        assert!(bins.contains(&0)); // Should contain top level bin
+                                    // Should contain bins from each level
+        assert!(bins.iter().any(|&x| x >= 1 && x <= 8)); // Level 1 (64MB bins)
+        assert!(bins.iter().any(|&x| x >= 9 && x <= 72)); // Level 2 (8MB bins)
+        assert!(bins.iter().any(|&x| x >= 73 && x <= 584)); // Level 3 (1MB bins)
+        assert!(bins.iter().any(|&x| x >= 585)); // Level 4 (128kb bins)
+    }
+    #[test]
+    fn test_region_to_bins_level_boundaries() {
+        let index = HierarchicalBins::default();
+
+        // Test 128kb boundary (level 4)
+        let bins = index.region_to_bins(0, 128 * 1024);
+        assert!(bins.contains(&585)); // First bin at level 4
+
+        // Test 1MB boundary (level 3)
+        let bins = index.region_to_bins(0, 1024 * 1024);
+        assert!(bins.contains(&73)); // First bin at level 3
+
+        // Test 8MB boundary (level 2)
+        let bins = index.region_to_bins(0, 8 * 1024 * 1024);
+        assert!(bins.contains(&9)); // First bin at level 2
+
+        // Test 64MB boundary (level 1)
+        let bins = index.region_to_bins(0, 64 * 1024 * 1024);
+        assert!(bins.contains(&1)); // First bin at level 1
+    }
+    #[test]
+    fn test_region_to_bins_overlapping_levels() {
+        let index = HierarchicalBins::default();
+
+        // Test range that spans multiple bin levels (1.5MB - should get bins from levels 3 and 4)
+        let bins = index.region_to_bins(0, 1_572_864); // 1.5MB
+
+        // Should have level 3 bin (1MB bins)
+        assert!(bins.iter().any(|&x| x >= 73 && x <= 584));
+
+        // Should have level 4 bins (128kb bins)
+        assert!(bins.iter().any(|&x| x >= 585));
+
+        // Should include bins from both the start and end of the range
+        let start_bins: Vec<_> = bins.iter().filter(|&&x| x >= 585).collect();
+        assert!(start_bins.len() > 1);
+    }
+    #[test]
+    fn test_region_to_bins_edge_cases() {
+        let index = HierarchicalBins::default();
+
+        // Test small range at boundary of two 128kb bins
+        let boundary = 128 * 1024;
+        let bins = index.region_to_bins(boundary - 1000, boundary + 1000);
+        assert!(bins.contains(&585)); // Should contain first bin
+        assert!(bins.contains(&586)); // Should contain second bin
+
+        // Test empty range (start == end)
+        let bins = index.region_to_bins(1000, 1000);
+        assert!(!bins.is_empty()); // Should still return the containing bin
+
+        // Test single base pair
+        let bins = index.region_to_bins(1000, 1001);
+        assert!(!bins.is_empty()); // Should return the containing bin
     }
 }
