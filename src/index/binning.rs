@@ -152,12 +152,19 @@ impl HierarchicalBins {
         let mut end_bin = end - 1;
 
         // First shift
+        println!("reg2bin Before shift: start={}, end={}", start, end);
         start_bin >>= self.base_shift;
         end_bin >>= self.base_shift;
+        println!("reg2bin After shift: start={}, end={}", start_bin, end_bin);
 
         // Check each level
-        for &offset in self.bin_offsets.iter() {
+        for (level, &offset) in self.bin_offsets.iter().enumerate() {
+            println!(
+                "Level {}: Checking if {}-{} fits in bin",
+                level, start_bin, end_bin
+            );
             if start_bin == end_bin {
+                println!("Found bin {} at level {}", offset + start_bin, level);
                 return offset + start_bin;
             }
             start_bin >>= self.level_shift;
@@ -175,11 +182,17 @@ impl HierarchicalBins {
         let mut end_bin = end - 1;
 
         // First shift with the initial shift amount (17 by default)
+        println!("reg2bins Before shift: start={}, end={}", start, end);
         start_bin >>= self.base_shift;
         end_bin >>= self.base_shift;
+        println!("reg2bins After shift: start={}, end={}", start_bin, end_bin);
 
         // For each level
-        for &offset in self.bin_offsets.iter() {
+        for (i, &offset) in self.bin_offsets.iter().enumerate() {
+            println!(
+                "Level {}: offset={}, start_bin={}, end_bin={}",
+                i, offset, start_bin, end_bin
+            );
             // Calculate all bins for this level between start and end
             let level_start = start_bin;
             let level_end = end_bin;
@@ -193,6 +206,7 @@ impl HierarchicalBins {
             start_bin >>= self.level_shift;
             end_bin >>= self.level_shift;
         }
+        println!("Found bins: {:?}", bins);
 
         bins
     }

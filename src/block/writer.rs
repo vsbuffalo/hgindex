@@ -1,4 +1,4 @@
-///
+/// block/writer.rs
 use super::{BlockBuffer, BlockConfig, CompressedBlock};
 use crate::SerdeType;
 use core::fmt;
@@ -36,12 +36,8 @@ impl<T: SerdeType> BlockWriter<T> {
 
     /// Check if the [`BlockWriter`] should be flushed (e.g. the
     /// current block serialized to binary, compressed, and written).
-    /// The conditions for flush:
-    ///
-    ///  1. Buffer size is >= max_records.
-    ///  2.
+    /// The conditions for flush are that the buffer size is >= max_records.
     fn should_flush(&self) -> bool {
-        // Removed new_start parameter
         if self.buffer.records.is_empty() {
             return false;
         }
@@ -100,6 +96,15 @@ impl<T: SerdeType> BlockWriter<T> {
             Ok(None)
         }
     }
+
+    /// Flush remaining records if any exist
+    pub fn finish(&mut self) -> io::Result<Option<CompressedBlock>> {
+        if self.buffer.records.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(self.flush()?))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -120,14 +125,14 @@ mod tests {
         })
         .unwrap();
 
-        println!("Adding first record");
+        // println!("Adding first record");
         // First record shouldn't trigger flush
         let result = writer
             .add_record(1000, 2000, TestRecord { value: 1 })
             .unwrap();
         assert!(result.is_none());
 
-        println!("Adding second record");
+        // println!("Adding second record");
         // Second record should trigger flush
         let result = writer
             .add_record(2000, 3000, TestRecord { value: 2 })
@@ -151,7 +156,7 @@ mod tests {
 
         // Add records until we trigger a flush
         for i in 0..max_records {
-            println!("Adding record {}", i);
+            // println!("Adding record {}", i);
             let start: u32 = i as u32;
             let end: u32 = i as u32 + 1000;
             let result = writer

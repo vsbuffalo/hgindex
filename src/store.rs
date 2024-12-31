@@ -88,8 +88,14 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
         end: u32,
         record: T,
     ) -> Result<(), HgIndexError> {
+        println!("Adding record: {}:{}-{}", chrom, start, end);
+
         let path = self.get_data_path(chrom);
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open(&path)?;
 
         // Get or create BlockWriter for this chromosome
         let writer = self
@@ -102,16 +108,22 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
         // Add to block writer
         if let Some(block) = writer.add_record(start, end, record)? {
             let offset = file.stream_position()?;
+            println!(
+                "Created block at offset {} with range {}-{}",
+                offset, block.start, block.end
+            );
+
             write_block(&mut file, &block)?;
-            self.index
-                .add_feature(chrom, block.start, block.end, offset)?;
+            self.index.add_feature(chrom, start, end, offset)?;
+        } else {
+            println!("Record added to existing block");
         }
 
         Ok(())
     }
 
     pub fn finalize(&mut self) -> Result<(), HgIndexError> {
-        // To avoid borrow check issues, first collect all the paths we'll need.
+        // First collect all paths to avoid borrow issues
         let mut path_map: HashMap<String, PathBuf> = HashMap::new();
         for chrom in self.block_writers.keys() {
             path_map.insert(chrom.clone(), self.get_data_path(chrom));
@@ -119,13 +131,24 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
 
         // Now handle the blocks
         for (chrom, writer) in self.block_writers.iter_mut() {
-            let block = writer.flush()?;
-            let path = &path_map[chrom];
-            let mut file = OpenOptions::new().append(true).open(path)?;
-            let offset = file.stream_position()?;
-            write_block(&mut file, &block)?;
-            self.index
-                .add_feature(chrom, block.start, block.end, offset)?;
+            // Force flush any remaining records
+            if let Some(block) = writer.finish()? {
+                // Call finish() to get remaining records
+                let path = &path_map[chrom];
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .append(true)
+                    .open(path)?;
+                let offset = file.stream_position()?;
+                println!(
+                    "In finalize: Writing block for {} at offset {} with range {}-{}",
+                    chrom, offset, block.start, block.end
+                );
+                write_block(&mut file, &block)?;
+                self.index
+                    .add_feature(chrom, block.start, block.end, offset)?;
+            }
         }
 
         // Write index to file
@@ -165,8 +188,11 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
     pub fn get_overlapping(&self, chrom: &str, start: u32, end: u32) -> io::Result<Vec<T>> {
         let mut results = Vec::new();
 
+        println!("Querying: {}:{}-{}", chrom, start, end);
+
         // Early return if chromosome not in index
         if !self.index.sequences.contains_key(chrom) {
+            println!("Chromosome {} not found in index", chrom);
             return Ok(results);
         }
 
@@ -175,17 +201,17 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
         let file = File::open(path)?;
         let mut reader = BlockReader::new(file);
 
-        for offset in self.index.find_overlapping(chrom, start, end) {
+        let offsets = self.index.find_overlapping(chrom, start, end);
+        println!("Found {} potential blocks to check", offsets.len());
+
+        for offset in offsets {
             reader.seek(SeekFrom::Start(offset))?;
-
-            // Read block header
             let block = reader.read_header()?;
+            println!("Checking block: {}-{}", block.start, block.end);
 
-            // Read and decompress records
             let records = reader.read_records(&block)?;
-
-            // Filter records that overlap our query
             for (rec_start, rec_end, record) in records {
+                println!("Checking record: {}-{}", rec_start, rec_end);
                 if rec_start < end && rec_end >= start {
                     results.push(record);
                 }
@@ -357,48 +383,6 @@ mod tests {
         score: f64,
     }
 
-    //#[test]
-    //fn test_zero_length_features() {
-    //    let test_dir = TestDir::new("zero_length").expect("Failed to create test dir");
-    //    let store_path = test_dir.path().join("test.gidx");
-    //    let mut store = GenomicDataStore::<MinimalTestRecord, ()>::create(&store_path, None)
-    //        .expect("Failed to create store");
-
-    //    // Test zero-length feature
-    //    store
-    //        .add_record("chr1", 1000, 1000, MinimalTestRecord { score: 1.2 })
-    //        .expect("Failed to add zero-length record");
-
-    //    store.finalize().expect("Failed to finalize store");
-
-    //    // Verify we can read it back
-    //    let store = GenomicDataStore::<MinimalTestRecord, ()>::open(&store_path, None)
-    //        .expect("Failed to open store");
-    //    let results = store
-    //        .get_overlapping("chr1", 1000, 1000)
-    //        .expect("Failed to get overlapping records");
-    //    assert_eq!(results.len(), 1);
-    //    assert_eq!(results[0].score, 1.2);
-
-    //    // Test position 0
-    //    let mut store = GenomicDataStore::<MinimalTestRecord, ()>::create(&store_path, None)
-    //        .expect("Failed to create store");
-    //    store
-    //        .add_record("chr1", 0, 100, MinimalTestRecord { score: 2.3 })
-    //        .expect("Failed to add record at position 0");
-
-    //    store.finalize().expect("Failed to finalize store");
-
-    //    // Verify we can read it back
-    //    let store = GenomicDataStore::<MinimalTestRecord, ()>::open(&store_path, None)
-    //        .expect("Failed to open store");
-    //    let results = store
-    //        .get_overlapping("chr1", 0, 50)
-    //        .expect("Failed to get overlapping records");
-    //    assert_eq!(results.len(), 1);
-    //    assert_eq!(results[0].score, 2.3);
-    //}
-
     #[test]
     fn test_concurrent_reads() {
         use std::sync::Arc;
@@ -462,86 +446,76 @@ mod tests {
         assert!(result_counts.iter().any(|&x| x != result_counts[0]));
     }
 
-    //#[test]
-    //fn test_edge_case_overlaps() {
-    //    let test_dir = TestDir::new("edge_overlaps").expect("Failed to create test dir");
-    //    let store_path = test_dir.path().join("test.gidx");
+    #[test]
+    fn test_edge_case_overlaps() {
+        let test_dir = TestDir::new("edge_overlaps").expect("Failed to create test dir");
+        let store_path = test_dir.path().join("test.gidx");
 
-    //    let mut store = GenomicDataStore::<MinimalTestRecord, ()>::create(&store_path, None)
-    //        .expect("Failed to create store");
+        let mut store = GenomicDataStore::<MinimalTestRecord, ()>::create(&store_path, None)
+            .expect("Failed to create store");
 
-    //    // Test cases with non-round numbers
-    //    let test_cases = vec![
-    //        // Small intervals
-    //        ("chr1", 5010061, 5010100, 1.0),
-    //        ("chr1", 5010062, 5010099, 2.0),
-    //        // Cross block boundary cases (assuming typical block sizes)
-    //        ("chr1", 65535, 65537, 3.0),   // Typical block size boundary
-    //        ("chr1", 131071, 131073, 4.0), // Another boundary
-    //        // Edge of bin cases
-    //        ("chr1", 4095, 4097, 5.0),   // Small bin boundary
-    //        ("chr1", 32767, 32769, 6.0), // Medium bin boundary
-    //        // Odd sized intervals
-    //        ("chr1", 1234567, 1234601, 7.0),
-    //        ("chr1", 7654321, 7654399, 8.0),
-    //    ];
+        // Test cases with non-round numbers
+        let test_cases = vec![
+            // Small intervals
+            ("chr1", 5010061, 5010100, 1.0),
+            ("chr1", 5010062, 5010099, 2.0),
+            // Cross block boundary cases (assuming typical block sizes)
+            ("chr1", 65535, 65537, 3.0),   // Typical block size boundary
+            ("chr1", 131071, 131073, 4.0), // Another boundary
+            // Edge of bin cases
+            ("chr1", 4095, 4097, 5.0),   // Small bin boundary
+            ("chr1", 32767, 32769, 6.0), // Medium bin boundary
+            // Odd sized intervals
+            ("chr1", 1234567, 1234601, 7.0),
+            ("chr1", 7654321, 7654399, 8.0),
+        ];
 
-    //    // Add all records
-    //    for (chrom, start, end, score) in &test_cases {
-    //        store
-    //            .add_record(chrom, *start, *end, MinimalTestRecord { score: *score })
-    //            .expect("Failed to add record");
-    //    }
+        // Add all records
+        for (chrom, start, end, score) in &test_cases {
+            store
+                .add_record(chrom, *start, *end, MinimalTestRecord { score: *score })
+                .expect("Failed to add record");
+        }
 
-    //    store.finalize().expect("Failed to finalize store");
+        store.finalize().expect("Failed to finalize store");
 
-    //    // Open store for querying
-    //    let store = GenomicDataStore::<MinimalTestRecord, ()>::open(&store_path, None)
-    //        .expect("Failed to open store");
+        // Open store for querying
+        let store = GenomicDataStore::<MinimalTestRecord, ()>::open(&store_path, None)
+            .expect("Failed to open store");
 
-    //    // Test various overlap scenarios
-    //    let overlap_tests = vec![
-    //        // Exact matches
-    //        ("chr1", 5010061, 5010100, 1),
-    //        // Partial overlaps
-    //        ("chr1", 5010050, 5010080, 1),
-    //        ("chr1", 5010080, 5010120, 1),
-    //        // Multiple overlaps
-    //        ("chr1", 5010060, 5010101, 2),
-    //        // Block boundary overlaps
-    //        ("chr1", 65530, 65540, 1),
-    //        ("chr1", 65530, 65600, 1),
-    //        // Bin boundary overlaps
-    //        ("chr1", 4090, 4100, 1),
-    //        ("chr1", 32760, 32780, 1),
-    //    ];
+        // Test various overlap scenarios
+        let overlap_tests = vec![
+            // Exact matches
+            ("chr1", 5010061, 5010100, 1),
+            // Partial overlaps
+            ("chr1", 5010050, 5010080, 1),
+            ("chr1", 5010080, 5010120, 1),
+            // Multiple overlaps
+            ("chr1", 5010060, 5010101, 2),
+            // Block boundary overlaps
+            ("chr1", 65530, 65540, 1),
+            ("chr1", 65530, 65600, 1),
+            // Bin boundary overlaps
+            ("chr1", 4090, 4100, 1),
+            ("chr1", 32760, 32780, 1),
+        ];
 
-    //    for (chrom, start, end, expected_count) in overlap_tests {
-    //        let results = store
-    //            .get_overlapping(chrom, start, end)
-    //            .expect("Failed to get overlapping records");
-    //        assert_eq!(
-    //            results.len(),
-    //            expected_count,
-    //            "Failed for range {}:{}-{}, expected {} overlaps, got {}",
-    //            chrom,
-    //            start,
-    //            end,
-    //            expected_count,
-    //            results.len()
-    //        );
-    //    }
-
-    //    // Test the specific problematic case
-    //    let results = store
-    //        .get_overlapping("chr1", 5010061, 5010100)
-    //        .expect("Failed to get overlapping records");
-    //    assert_eq!(
-    //        results.len(),
-    //        1,
-    //        "Failed to find overlap for specific test case 5010061-5010100"
-    //    );
-    //}
+        for (chrom, start, end, expected_count) in overlap_tests {
+            let results = store
+                .get_overlapping(chrom, start, end)
+                .expect("Failed to get overlapping records");
+            assert_eq!(
+                results.len(),
+                expected_count,
+                "Failed for range {}:{}-{}, expected {} overlaps, got {}",
+                chrom,
+                start,
+                end,
+                expected_count,
+                results.len()
+            );
+        }
+    }
 
     //#[test]
     //fn test_block_boundary_handling() {
@@ -579,57 +553,123 @@ mod tests {
     //    }
     //}
 
-    //#[test]
-    //fn test_tiny_overlaps() {
-    //    let test_dir = TestDir::new("tiny_overlaps").expect("Failed to create test dir");
-    //    let store_path = test_dir.path().join("test.gidx");
-    //    let mut store = GenomicDataStore::<MinimalTestRecord, ()>::create(&store_path, None)
-    //        .expect("Failed to create store");
+    #[test]
+    fn test_tiny_overlaps() {
+        let test_dir = TestDir::new("tiny_overlaps").expect("Failed to create test dir");
+        let store_path = test_dir.path().join("test.gidx");
+        let mut store = GenomicDataStore::<MinimalTestRecord, ()>::create(&store_path, None)
+            .expect("Failed to create store");
 
-    //    // Add records with 1-base overlaps at different positions
-    //    let test_cases = vec![
-    //        (1000, 2000, 1999, 2001), // 1-base overlap at end
-    //        (3000, 4000, 2999, 3001), // 1-base overlap at start
-    //        (5000, 5001, 5000, 5001), // Exact 1-base overlap
-    //    ];
+        // Add records with 1-base overlaps at different positions
+        let test_cases = vec![
+            (1000, 2000, 1999, 2001), // 1-base overlap at end
+            (3000, 4000, 2999, 3001), // 1-base overlap at start
+            (5000, 5001, 5000, 5001), // Exact 1-base overlap
+        ];
 
-    //    for (start1, end1, start2, end2) in &test_cases {
-    //        store
-    //            .add_record("chr1", *start1, *end1, MinimalTestRecord { score: 1.0 })
-    //            .expect("Failed to add first record");
-    //        store
-    //            .add_record("chr1", *start2, *end2, MinimalTestRecord { score: 2.0 })
-    //            .expect("Failed to add second record");
-    //    }
+        for (start1, end1, start2, end2) in &test_cases {
+            store
+                .add_record("chr1", *start1, *end1, MinimalTestRecord { score: 1.0 })
+                .expect("Failed to add first record");
+            store
+                .add_record("chr1", *start2, *end2, MinimalTestRecord { score: 2.0 })
+                .expect("Failed to add second record");
+        }
 
-    //    store.finalize().expect("Failed to finalize store");
+        store.finalize().expect("Failed to finalize store");
 
-    //    let store = GenomicDataStore::<MinimalTestRecord, ()>::open(&store_path, None)
-    //        .expect("Failed to open store");
+        let store = GenomicDataStore::<MinimalTestRecord, ()>::open(&store_path, None)
+            .expect("Failed to open store");
 
-    //    // Test each overlap case
-    //    for (start1, end1, start2, end2) in test_cases {
-    //        let results = store
-    //            .get_overlapping("chr1", start1, end1)
-    //            .expect("Failed to get overlapping records");
-    //        assert_eq!(
-    //            results.len(),
-    //            2,
-    //            "Failed to find tiny overlap at {}-{}",
-    //            start1,
-    //            end1
-    //        );
+        // Test each overlap case
+        for (start1, end1, start2, end2) in test_cases {
+            let results = store
+                .get_overlapping("chr1", start1, end1)
+                .expect("Failed to get overlapping records");
+            assert_eq!(
+                results.len(),
+                2,
+                "Failed to find tiny overlap at {}-{}",
+                start1,
+                end1
+            );
 
-    //        let results = store
-    //            .get_overlapping("chr1", start2, end2)
-    //            .expect("Failed to get overlapping records");
-    //        assert_eq!(
-    //            results.len(),
-    //            2,
-    //            "Failed to find tiny overlap at {}-{}",
-    //            start2,
-    //            end2
-    //        );
-    //    }
-    //}
+            let results = store
+                .get_overlapping("chr1", start2, end2)
+                .expect("Failed to get overlapping records");
+            assert_eq!(
+                results.len(),
+                2,
+                "Failed to find tiny overlap at {}-{}",
+                start2,
+                end2
+            );
+        }
+    }
+    #[test]
+    fn test_block_file_offsets() {
+        let test_dir = TestDir::new("block_offsets").expect("Failed to create test dir");
+        let store_path = test_dir.path().join("test.gidx");
+        let mut store = GenomicDataStore::<MinimalTestRecord, ()>::create(&store_path, None)
+            .expect("Failed to create store");
+
+        // Add records with distinctive scores so we can track them
+        println!("\nAdding first record:");
+        store
+            .add_record("chr1", 1000, 2000, MinimalTestRecord { score: 1.0 })
+            .unwrap();
+
+        println!("\nAdding second record:");
+        store
+            .add_record("chr1", 5000000, 5000100, MinimalTestRecord { score: 2.0 })
+            .unwrap();
+
+        println!("\nAdding third record:");
+        store
+            .add_record("chr1", 3000, 4000, MinimalTestRecord { score: 3.0 })
+            .unwrap();
+
+        println!("\nFinalizing store:");
+        store.finalize().expect("Failed to finalize store");
+
+        // Open store for querying
+        let store = GenomicDataStore::<MinimalTestRecord, ()>::open(&store_path, None)
+            .expect("Failed to open store");
+
+        // Query each record individually
+        println!("\nQuerying first record:");
+        let results = store.get_overlapping("chr1", 1000, 2000).unwrap();
+        println!(
+            "Found {} results with scores: {:?}",
+            results.len(),
+            results.iter().map(|r| r.score).collect::<Vec<_>>()
+        );
+
+        println!("\nQuerying second record:");
+        let results = store.get_overlapping("chr1", 5000000, 5000100).unwrap();
+        println!(
+            "Found {} results with scores: {:?}",
+            results.len(),
+            results.iter().map(|r| r.score).collect::<Vec<_>>()
+        );
+
+        println!("\nQuerying third record:");
+        let results = store.get_overlapping("chr1", 3000, 4000).unwrap();
+        println!(
+            "Found {} results with scores: {:?}",
+            results.len(),
+            results.iter().map(|r| r.score).collect::<Vec<_>>()
+        );
+
+        // Add assertions
+        assert!(store.get_overlapping("chr1", 1000, 2000).unwrap().len() > 0);
+        assert!(
+            store
+                .get_overlapping("chr1", 5000000, 5000100)
+                .unwrap()
+                .len()
+                > 0
+        );
+        assert!(store.get_overlapping("chr1", 3000, 4000).unwrap().len() > 0);
+    }
 }

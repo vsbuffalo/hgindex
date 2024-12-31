@@ -62,6 +62,7 @@ pub struct BlockBuffer<T> {
     pub end: u32,
 }
 
+pub mod iterator;
 pub mod reader;
 pub mod writer;
 
