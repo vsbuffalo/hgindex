@@ -106,16 +106,20 @@ impl<M: SerdeType> BinningIndex<M> {
             return Err(HgIndexError::InvalidInterval { start, end });
         }
         let binning = HierarchicalBins::default();
+        println!(
+            "Adding feature to index: {}:{}-{} at offset {}",
+            chrom, start, end, index
+        );
         let bin_id = binning.region_to_bin(start, end);
+        println!("Assigned to bin: {}", bin_id);
 
-        // the chromosome-level index
+        // Get or create chromosome bin index
         let bin_index = self.sequences.entry(chrom.to_string()).or_default();
 
-        // make the feature
-        let feature = Feature { start, end, index };
-
-        // insert the feature
-        bin_index.bins.entry(bin_id).or_default().push(feature);
+        // Add feature to bin
+        let features = bin_index.bins.entry(bin_id).or_default();
+        println!("Bin {} now has {} features", bin_id, features.len() + 1);
+        features.push(Feature { start, end, index });
 
         // Update linear index
         let linear_idx = start >> binning.linear_shift;
@@ -132,29 +136,45 @@ impl<M: SerdeType> BinningIndex<M> {
     /// Return the indices (e.g. file offsets) of all ranges that overlap with the supplied range.
     pub fn find_overlapping(&self, chrom: &str, start: u32, end: u32) -> Vec<u64> {
         let Some(chrom_index) = self.sequences.get(chrom) else {
+            println!("No index found for chromosome {}", chrom);
             return vec![];
         };
 
         let binning = HierarchicalBins::default();
         let bins_to_check = binning.region_to_bins(start, end);
-        let mut overlapping = Vec::new();
+        println!(
+            "Checking bins for {}:{}-{}: {:?}",
+            chrom, start, end, bins_to_check
+        );
 
+        let mut overlapping = Vec::new();
         let min_offset = {
             let linear_idx = start >> binning.linear_shift;
             if linear_idx < chrom_index.linear_index.len() as u32 {
                 chrom_index.linear_index[linear_idx as usize]
             } else {
-                return vec![];
+                println!(
+                    "Linear index {} out of range, using 0 as min_offset",
+                    linear_idx
+                );
+                0 // Default to 0 when out of range
             }
         };
 
         for bin_id in bins_to_check {
             if let Some(features) = chrom_index.bins.get(&bin_id) {
+                println!("Bin {} has {} features", bin_id, features.len());
                 for feature in features {
                     if feature.index >= min_offset && feature.start < end && feature.end > start {
+                        println!(
+                            "Found overlapping feature: {}-{}",
+                            feature.start, feature.end
+                        );
                         overlapping.push(feature.index);
                     }
                 }
+            } else {
+                println!("No features in bin {}", bin_id);
             }
         }
 
