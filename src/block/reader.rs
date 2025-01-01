@@ -79,7 +79,7 @@ impl<R: Read + Seek> BlockReader<R> {
 
 #[cfg(test)]
 mod tests {
-    use crate::block::{BlockConfig, BlockWriter};
+    use crate::block::{write_block, BlockConfig, BlockWriter};
 
     use super::*;
     use serde::{Deserialize, Serialize};
@@ -142,5 +142,63 @@ mod tests {
         // Read records
         let records: Vec<(u32, u32, TestRecord)> = reader.read_records(&header).unwrap();
         assert_eq!(records, test_records);
+    }
+
+    #[test]
+    fn test_block_round_trip() {
+        use std::io::Cursor;
+
+        // Create test record
+        let mut writer = BlockWriter::new(BlockConfig {
+            max_records: 1, // Force flush after 1 record
+            level: 3,
+        })
+        .unwrap();
+
+        let test_record = TestRecord { value: 42 };
+
+        // First attempt to get block via add_record
+        let block = writer
+            .add_record(5000000, 5000100, test_record.clone())
+            .unwrap();
+
+        // If None, try to finish the writer to get the block
+        let block = if let Some(block) = block {
+            block
+        } else {
+            writer
+                .finish()
+                .unwrap()
+                .expect("Should get block from finish")
+        };
+
+        // println!("Got block with {} records", block.n_records);
+
+        // Verify block metadata
+        assert_eq!(block.start, 5000000);
+        assert_eq!(block.end, 5000100);
+        assert_eq!(block.n_records, 1);
+
+        // Write block to buffer
+        let mut buffer = Vec::new();
+        write_block(&mut buffer, &block).unwrap();
+
+        // Read back using BlockReader
+        let cursor = Cursor::new(buffer);
+        let mut reader = BlockReader::new(cursor);
+
+        // Read and verify header
+        let header = reader.read_header().unwrap();
+        assert_eq!(header.start, 5000000);
+        assert_eq!(header.end, 5000100);
+        assert_eq!(header.n_records, 1);
+
+        // Read and verify records
+        let records: Vec<(u32, u32, TestRecord)> = reader.read_records(&header).unwrap();
+        assert_eq!(records.len(), 1);
+        let (start, end, record) = &records[0];
+        assert_eq!(*start, 5000000);
+        assert_eq!(*end, 5000100);
+        assert_eq!(record, &test_record);
     }
 }
