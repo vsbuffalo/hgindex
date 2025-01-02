@@ -54,8 +54,8 @@ where
 pub struct SequenceIndex {
     // Map from bin ID to list of features in that bin
     pub bins: IndexMap<u32, Vec<Feature>>,
-    // Linear index for quick region querieskjj
-    pub linear_index: Vec<u64>, // File offsets every 16kb
+    // Linear index for quick region queries
+    pub linear_index: Vec<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -109,7 +109,7 @@ impl<M: SerdeType> BinningIndex<M> {
         bin_index.bins.entry(bin_id).or_default().push(feature);
 
         // Update linear index
-        let linear_idx = start >> 14; // 16kb chunks (2^14)
+        let linear_idx = start >> binning.linear_shift;
         if linear_idx >= bin_index.linear_index.len() as u32 {
             bin_index
                 .linear_index
@@ -132,10 +132,13 @@ impl<M: SerdeType> BinningIndex<M> {
 
         // Use linear index to find minimum file offset to start checking
         let min_offset = {
-            let linear_idx = start >> 14;
-            if linear_idx < chrom_index.linear_index.len() as u32 {
+            let linear_idx = start >> binning.linear_shift;
+            let max_linear_idx = chrom_index.linear_index.len();
+            if linear_idx < max_linear_idx as u32 {
                 chrom_index.linear_index[linear_idx as usize]
             } else {
+                // If we're beyond the end of the linear index, there can't be any features
+                // that overlap this region, so return an empty vector
                 return vec![];
             }
         };
@@ -180,9 +183,7 @@ impl SequenceIndex {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
-    use tempfile;
 
     fn make_test_case_01() -> BinningIndex<()> {
         let mut index = BinningIndex::new();
@@ -221,5 +222,87 @@ mod tests {
         // read the index into new object
         let obj = BinningIndex::open(&index_file).expect("Error reading index");
         assert_eq!(index, obj);
+    }
+
+    #[test]
+    fn test_bin_boundaries() {
+        let index = HierarchicalBins::default();
+
+        // Test ranges exactly matching bin sizes
+        let bin1 = index.region_to_bin(0, 128 * 1024);
+        let bin2 = index.region_to_bin(128 * 1024, 256 * 1024);
+
+        // Test off-by-one ranges
+        let bin3 = index.region_to_bin(0, (128 * 1024) - 1);
+        let bin4 = index.region_to_bin(0, (128 * 1024) + 1);
+
+        assert_ne!(bin1, bin2);
+        assert_eq!(bin3, bin1);
+        assert_ne!(bin4, bin1);
+    }
+
+    #[test]
+    fn test_bed_interval_semantics() {
+        let mut index = BinningIndex::<()>::new();
+
+        // Test single-base features
+        index.add_feature("chr1", 100, 101, 1); // One base at position 100
+
+        // Test adjacent features
+        index.add_feature("chr1", 200, 300, 2); // 100 bases
+        index.add_feature("chr1", 300, 400, 3); // Next 100 bases, should not overlap
+
+        // Test overlapping features
+        index.add_feature("chr1", 500, 600, 4); // 100 bases
+        index.add_feature("chr1", 550, 650, 5); // Overlaps with previous
+
+        // Test zero-based coordinate system
+        index.add_feature("chr1", 0, 10, 6); // First 10 bases
+
+        // Test queries
+
+        // Single base queries
+        let overlaps = index.find_overlapping("chr1", 100, 101);
+        assert_eq!(overlaps, vec![1], "Single base feature");
+
+        // Query empty space between adjacent features
+        let overlaps = index.find_overlapping("chr1", 299, 300);
+        assert_eq!(overlaps, vec![2], "Should only contain first feature");
+        let overlaps = index.find_overlapping("chr1", 300, 301);
+        assert_eq!(overlaps, vec![3], "Should only contain second feature");
+
+        // Query exact feature boundaries
+        let overlaps = index.find_overlapping("chr1", 200, 300);
+        assert_eq!(overlaps, vec![2], "Exact feature bounds");
+
+        // Query overlapping region
+        let overlaps = index.find_overlapping("chr1", 540, 560);
+        assert_eq!(overlaps, vec![4, 5], "Overlapping features");
+
+        // Query start of coordinate system
+        let overlaps = index.find_overlapping("chr1", 0, 5);
+        assert_eq!(overlaps, vec![6], "Zero-based start");
+
+        // Single-base query at feature boundaries
+        let overlaps = index.find_overlapping("chr1", 500, 501);
+        assert_eq!(overlaps, vec![4], "Start boundary");
+        let overlaps = index.find_overlapping("chr1", 599, 600);
+        assert_eq!(overlaps, vec![4, 5], "End boundary");
+    }
+
+    #[test]
+    fn test_bed_adjacent_intervals() {
+        let mut index = BinningIndex::<()>::new();
+
+        // Two adjacent features
+        index.add_feature("chr1", 100, 200, 1); // [100,200)
+        index.add_feature("chr1", 200, 300, 2); // [200,300)
+
+        // Query the boundary
+        let overlaps = index.find_overlapping("chr1", 200, 201);
+        assert_eq!(overlaps, vec![2], "Should only match second feature");
+
+        let overlaps = index.find_overlapping("chr1", 199, 200);
+        assert_eq!(overlaps, vec![1], "Should only match first feature");
     }
 }

@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{index::BinningIndex, SerdeType};
+use crate::{error::HgIndexError, index::BinningIndex, SerdeType};
 
 #[derive(Debug)]
 pub struct GenomicDataStore<T, M>
@@ -175,17 +175,29 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
     }
 
     /// The features overlapping the range with this start and end position.
-    pub fn get_overlapping(&mut self, chrom: &str, start: u32, end: u32) -> Vec<T> {
+    pub fn get_overlapping(
+        &mut self,
+        chrom: &str,
+        start: u32,
+        end: u32,
+    ) -> Result<Vec<T>, HgIndexError> {
+        if end <= start {
+            return Err(HgIndexError::InvalidInterval { start, end });
+        }
+        // Early return empty vec if chromosome not in index
+        if !self.index.sequences.contains_key(chrom) {
+            return Ok(Vec::new());
+        }
         let mut results = Vec::new();
 
         // Early return if chromosome not in index
         if !self.index.sequences.contains_key(chrom) {
-            return results;
+            return Ok(results);
         }
 
         // Open chromosome file if not already open
         if self.open_chrom_file(chrom).is_err() {
-            return results;
+            return Ok(results);
         }
 
         let file = self.data_files.get_mut(chrom).unwrap();
@@ -207,7 +219,7 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
                 }
             }
         }
-        results
+        Ok(results)
     }
 }
 
@@ -286,17 +298,17 @@ mod tests {
             .expect("Failed to open store");
 
         // Test overlapping query
-        let results = store.get_overlapping("chr1", 1200, 1800);
+        let results = store.get_overlapping("chr1", 1200, 1800).unwrap();
         assert_eq!(results.len(), 2); // Should get both chr1 features
         assert_eq!(results[0].name, "feature1");
         assert_eq!(results[1].name, "feature2");
 
         // Test non-overlapping region
-        let results = store.get_overlapping("chr1", 3000, 4000);
+        let results = store.get_overlapping("chr1", 3000, 4000).unwrap();
         assert_eq!(results.len(), 0);
 
         // Test different chromosome
-        let results = store.get_overlapping("chr2", 55000, 58000);
+        let results = store.get_overlapping("chr2", 55000, 58000).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "feature3");
     }
@@ -329,7 +341,7 @@ mod tests {
         let mut store = GenomicDataStore::<TestRecord, ()>::open(&store_path, None)
             .expect("Failed to open store");
 
-        let results = store.get_overlapping("chr1", 0, 1000);
+        let results = store.get_overlapping("chr1", 0, 1000).unwrap();
         assert_eq!(results.len(), 0);
     }
 
@@ -438,7 +450,7 @@ mod tests {
                     // Each thread queries a different but overlapping region
                     let start = i * 500;
                     let end = start + 2000;
-                    let results = store.get_overlapping("chr1", start, end);
+                    let results = store.get_overlapping("chr1", start, end).unwrap();
 
                     // Results should not be empty due to overlapping regions
                     assert!(!results.is_empty());

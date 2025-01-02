@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+pub mod error;
 pub mod index;
 pub mod store;
 
