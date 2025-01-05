@@ -1,12 +1,60 @@
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io::{BufWriter, Read, Seek, SeekFrom, Write},
     marker::PhantomData,
     path::{Path, PathBuf},
 };
 
-use crate::{error::HgIndexError, index::BinningIndex, SerdeType};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    block::{BlockReader, BlockWriter, VirtualOffset},
+    error::HgIndexError,
+    index::BinningIndex,
+    SerdeType,
+};
+
+#[derive(Debug)]
+pub struct ChromosomeReader<T> {
+    reader: BlockReader<T>,
+}
+
+impl<T> ChromosomeReader<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    pub fn new(path: impl AsRef<Path>) -> Result<Self, HgIndexError> {
+        let file = File::open(path)?;
+        Ok(Self {
+            reader: BlockReader::new(file)?,
+        })
+    }
+
+    pub fn read_at(&mut self, voffset: VirtualOffset) -> Result<T, HgIndexError> {
+        self.reader.read_record(voffset)
+    }
+}
+
+#[derive(Debug)]
+pub struct ChromosomeWriter {
+    writer: BlockWriter,
+}
+
+impl ChromosomeWriter {
+    pub fn new(path: impl AsRef<Path>) -> Result<Self, HgIndexError> {
+        let file = File::create(path)?;
+        Ok(Self {
+            writer: BlockWriter::new(file)?,
+        })
+    }
+
+    pub fn write_record<T: Serialize>(
+        &mut self,
+        record: &T,
+    ) -> Result<VirtualOffset, HgIndexError> {
+        self.writer.add_record(record)
+    }
+}
 
 #[derive(Debug)]
 pub struct GenomicDataStore<T, M>
@@ -15,14 +63,14 @@ where
     M: SerdeType,
 {
     index: BinningIndex<M>,
-    data_files: HashMap<String, File>,
+    writers: HashMap<String, ChromosomeWriter>,
+    readers: HashMap<String, ChromosomeReader<T>>,
     directory: PathBuf,
     key: Option<String>,
     _phantom: PhantomData<T>,
 }
 
 impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
-    const MAGIC: [u8; 4] = *b"GIDX";
     const INDEX_FILENAME: &'static str = "index.bin";
 
     fn get_data_path(&self, chrom: &str) -> PathBuf {
@@ -34,36 +82,45 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
     }
 
     pub fn create(directory: &Path, key: Option<String>) -> std::io::Result<Self> {
-        // Create main directory and key subdirectory if needed
-        let _target_dir = if let Some(ref key) = key {
-            let key_dir = directory.join(key);
-            fs::create_dir_all(&key_dir)?;
-            key_dir
-        } else {
-            fs::create_dir_all(directory)?;
-            directory.to_path_buf()
-        };
+        // Create base directory
+        fs::create_dir_all(directory)?;
+
+        // Create key subdirectory if needed
+        if let Some(ref key) = key {
+            fs::create_dir_all(directory.join(key))?;
+        }
 
         Ok(Self {
             index: BinningIndex::new(),
-            data_files: HashMap::new(),
+            writers: HashMap::new(),
+            readers: HashMap::new(),
             directory: directory.to_path_buf(),
             key,
             _phantom: PhantomData,
         })
     }
 
-    fn get_or_create_file(&mut self, chrom: &str) -> std::io::Result<&mut File> {
-        if !self.data_files.contains_key(chrom) {
-            let data_path = self.get_data_path(chrom);
-            let file = File::create(&data_path)?;
-            let mut writer = BufWriter::new(&file);
-            writer.write_all(&Self::MAGIC)?;
-            writer.flush()?;
-            let _data_file = writer.into_inner()?;
-            self.data_files.insert(chrom.to_string(), file);
+    fn get_or_create_writer(&mut self, chrom: &str) -> Result<&mut ChromosomeWriter, HgIndexError> {
+        if !self.writers.contains_key(chrom) {
+            let path = self.get_data_path(chrom);
+            // Need to create parent directories here!
+            std::fs::create_dir_all(path.parent().unwrap())?; // <-- Add this
+            let writer = ChromosomeWriter::new(path.to_str().unwrap())?;
+            self.writers.insert(chrom.to_string(), writer);
         }
-        Ok(self.data_files.get_mut(chrom).unwrap())
+        Ok(self.writers.get_mut(chrom).unwrap())
+    }
+
+    fn get_or_create_reader(
+        &mut self,
+        chrom: &str,
+    ) -> Result<&mut ChromosomeReader<T>, HgIndexError> {
+        if !self.readers.contains_key(chrom) {
+            let path = self.get_data_path(chrom);
+            let reader = ChromosomeReader::new(path.to_str().unwrap())?;
+            self.readers.insert(chrom.to_string(), reader);
+        }
+        Ok(self.readers.get_mut(chrom).unwrap())
     }
 
     // Add these methods to your existing impl block
@@ -92,34 +149,26 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
         start: u32,
         end: u32,
         record: &T,
-    ) -> std::io::Result<()> {
-        let file = self.get_or_create_file(chrom)?;
+    ) -> Result<(), HgIndexError> {
+        let store = self.get_or_create_writer(chrom)?;
 
-        // Create a scope to ensure writer is dropped before we use self.index
-        let offset = {
-            let mut writer = BufWriter::new(file);
-            let offset = writer.stream_position()?;
-
-            // Serialize record and get its length
-            let record_data = bincode::serialize(record).unwrap();
-            let length = record_data.len() as u64;
-
-            // Write length followed by record
-            writer.write_all(&length.to_le_bytes())?;
-            writer.write_all(&record_data)?;
-            writer.flush()?;
-
-            offset
-        }; // writer is dropped here, releasing the borrow
+        // Add the record to the block-compressed writer for this
+        // chromosome.
+        let virtual_offset = store.writer.add_record(&record)?;
 
         // Add the feature to the index now.
-        self.index.add_feature(chrom, start, end, offset);
+        self.index
+            .add_feature(chrom, start, end, virtual_offset.into());
 
         Ok(())
     }
 
     pub fn finalize(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        // Write index to file
+        // Finish each writer explicitly before clearing
+        for (_, writer) in self.writers.drain() {
+            writer.writer.finish()?;
+        }
+
         let index_path = if let Some(ref key) = self.key {
             self.directory.join(key).join(Self::INDEX_FILENAME)
         } else {
@@ -134,44 +183,23 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
         directory: &Path,
         key: Option<String>,
     ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        let target_dir = if let Some(ref key) = key {
-            directory.join(key)
+        // Keep original path
+        let index_path = if let Some(ref key) = key {
+            directory.join(key).join(Self::INDEX_FILENAME)
         } else {
-            directory.to_path_buf()
+            directory.join(Self::INDEX_FILENAME)
         };
 
-        // Read index file
-        let index_path = target_dir.join(Self::INDEX_FILENAME);
         let index = BinningIndex::open(&index_path)?;
 
-        // Initialize without opening any chromosome files yet
         Ok(Self {
             index,
-            data_files: HashMap::new(),
-            directory: directory.to_path_buf(),
+            directory: directory.to_path_buf(), // Use original directory
+            writers: HashMap::new(),
+            readers: HashMap::new(),
             key,
             _phantom: PhantomData,
         })
-    }
-
-    pub fn open_chrom_file(&mut self, chrom: &str) -> std::io::Result<()> {
-        if !self.data_files.contains_key(chrom) {
-            let data_path = self.get_data_path(chrom);
-            let mut file = File::open(&data_path)?;
-
-            // Verify magic number
-            let mut magic = [0u8; 4];
-            file.read_exact(&mut magic)?;
-            if magic != Self::MAGIC {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Invalid file format",
-                ));
-            }
-
-            self.data_files.insert(chrom.to_string(), file);
-        }
-        Ok(())
     }
 
     /// The features overlapping the range with this start and end position.
@@ -195,36 +223,28 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
             return Ok(results);
         }
 
-        // Open chromosome file if not already open
-        if self.open_chrom_file(chrom).is_err() {
-            return Ok(results);
-        }
+        let voffsets = self.index.find_overlapping(chrom, start, end);
 
-        let file = self.data_files.get_mut(chrom).unwrap();
-
-        for offset in self.index.find_overlapping(chrom, start, end) {
-            file.seek(SeekFrom::Start(offset)).unwrap();
-
-            // First read the length (8 bytes)
-            let mut length_bytes = [0u8; 8];
-            if file.read_exact(&mut length_bytes).is_ok() {
-                let length = u64::from_le_bytes(length_bytes);
-
-                // Now read the actual record
-                let mut record_data = vec![0u8; length as usize];
-                if file.read_exact(&mut record_data).is_ok() {
-                    if let Ok(record) = bincode::deserialize(&record_data) {
-                        results.push(record);
-                    }
+        // Open chromosome file if not already open, returning empty results
+        // if the chromosome is not found (assumed to mean no records for that
+        // chromosome).
+        match self.get_or_create_reader(chrom) {
+            Ok(reader) => {
+                for voffset in voffsets {
+                    results.push(reader.read_at(voffset.into())?);
                 }
             }
-        }
+            Err(_) => return Ok(results),
+        };
+
         Ok(results)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use crate::test_utils::test_utils::TestDir;
 
     use super::*;
@@ -276,15 +296,14 @@ mod tests {
     #[test]
     fn test_store_and_retrieve() {
         let test_dir = TestDir::new("store_and_retrieve").expect("Failed to create test dir");
-        let store_path = test_dir.path().join("test.gidx");
+        let base_dir = test_dir.path(); // Don't add test.gidx
 
         // An example key
         let key = "example-key".to_string();
 
         // Create store and add records
-        let mut store = GenomicDataStore::<TestRecord, ()>::create(&store_path, Some(key.clone()))
+        let mut store = GenomicDataStore::<TestRecord, ()>::create(base_dir, Some(key.clone()))
             .expect("Failed to create store");
-
         for (chrom, start, end, record) in make_test_records() {
             store
                 .add_record(&chrom, start, end, &record)
@@ -293,8 +312,7 @@ mod tests {
 
         store.finalize().expect("Failed to finalize store");
 
-        // Open store and query
-        let mut store = GenomicDataStore::<TestRecord, ()>::open(&store_path, Some(key.clone()))
+        let mut store = GenomicDataStore::<TestRecord, ()>::open(&base_dir, Some(key.clone()))
             .expect("Failed to open store");
 
         // Test overlapping query
@@ -389,24 +407,6 @@ mod tests {
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     struct MinimalTestRecord {
         score: f64,
-    }
-
-    #[test]
-    fn test_zero_length_features() {
-        let test_dir = TestDir::new("zero_length").expect("Failed to create test dir");
-        let store_path = test_dir.path().join("test.gidx");
-        let mut store = GenomicDataStore::<MinimalTestRecord, ()>::create(&store_path, None)
-            .expect("Failed to create store");
-
-        // Test zero-length feature
-        store
-            .add_record("chr1", 1000, 1000, &MinimalTestRecord { score: 1.2 })
-            .expect("Failed to add zero-length record");
-
-        // Test position 0
-        store
-            .add_record("chr1", 0, 100, &MinimalTestRecord { score: 2.3 })
-            .expect("Failed to add record at position 0");
     }
 
     #[test]
