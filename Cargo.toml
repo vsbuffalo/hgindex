@@ -37,3 +37,6 @@ required-features = ["cli"]
 [[bench]]
 name = "query_benchmark"
 harness = false
+
+[profile.release]
+opt-level = 3

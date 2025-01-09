@@ -66,11 +66,15 @@ mod tests {
         data: String,
     }
 
-    fn create_test_record(id: u32, data_size: usize) -> TestRecord {
-        TestRecord {
-            id,
-            data: "x".repeat(data_size),
-        }
+    fn create_test_record(id: u32, data_size: usize) -> (u32, u32, TestRecord) {
+        (
+            0,
+            100,
+            TestRecord {
+                id,
+                data: "x".repeat(data_size),
+            },
+        )
     }
 
     #[test]
@@ -88,9 +92,9 @@ mod tests {
         // Read it back
         let file = File::open(&path)?;
         let mut reader = BlockReader::new(file)?;
-        let read_record: TestRecord = reader.read_record(offset)?;
+        let read_record: TestRecord = reader.read_record(offset)?.2;
 
-        assert_eq!(record, read_record);
+        assert_eq!(record.2, read_record);
         Ok(())
     }
 
@@ -115,8 +119,8 @@ mod tests {
         let mut reader = BlockReader::new(file)?;
 
         for (record, offset) in records.iter().zip(offsets.iter()) {
-            let read_record: TestRecord = reader.read_record(*offset)?;
-            assert_eq!(record, &read_record);
+            let read_record: TestRecord = reader.read_record(*offset)?.2;
+            assert_eq!(record.2, read_record);
         }
 
         Ok(())
@@ -138,9 +142,9 @@ mod tests {
         // Read it back
         let file = File::open(&path)?;
         let mut reader = BlockReader::new(file)?;
-        let read_record: TestRecord = reader.read_record(offset)?;
+        let read_record: TestRecord = reader.read_record(offset)?.2;
 
-        assert_eq!(large_record, read_record);
+        assert_eq!(large_record.2, read_record);
         Ok(())
     }
 
@@ -171,8 +175,8 @@ mod tests {
 
         // Read in reverse order to test seeking
         for (record, offset) in records.iter().zip(offsets.iter()).rev() {
-            let read_record: TestRecord = reader.read_record(*offset)?;
-            assert_eq!(record, &read_record);
+            let read_record: TestRecord = reader.read_record(*offset)?.2;
+            assert_eq!(record.2, read_record);
         }
 
         Ok(())
@@ -212,9 +216,9 @@ mod tests {
 
         // Verify each record
         for (idx, (record, offset)) in records.iter().zip(offsets.iter()).enumerate() {
-            let read_record: TestRecord = reader.read_record(*offset)?;
+            let read_record: TestRecord = reader.read_record(*offset)?.2;
             assert_eq!(
-                record, &read_record,
+                record.2, read_record,
                 "Record {} failed to match at offset {:?}",
                 idx, offset
             );
@@ -244,9 +248,9 @@ mod tests {
         // Read it back
         let file = File::open(&path)?;
         let mut reader = BlockReader::new(file)?;
-        let read_record: TestRecord = reader.read_record(offset)?;
+        let read_record: TestRecord = reader.read_record(offset)?.2;
 
-        assert_eq!(record, read_record);
+        assert_eq!(record.2, read_record);
         Ok(())
     }
 
@@ -267,8 +271,8 @@ mod tests {
         // Read it back to verify
         let file = File::open(&path)?;
         let mut reader = BlockReader::new(file)?;
-        let read_record: TestRecord = reader.read_record(offset)?;
-        assert_eq!(small_record, read_record);
+        let read_record: TestRecord = reader.read_record(offset)?.2;
+        assert_eq!(small_record.2, read_record);
         Ok(())
     }
 
@@ -301,8 +305,8 @@ mod tests {
         let mut rng = rand::thread_rng();
         for _ in 0..100 {
             let idx = rng.gen_range(0..num_records);
-            let read_record: TestRecord = reader.read_record(offsets[idx])?;
-            assert_eq!(records[idx], read_record);
+            let read_record: TestRecord = reader.read_record(offsets[idx])?.2;
+            assert_eq!(records[idx].2, read_record);
         }
 
         Ok(())
@@ -332,8 +336,8 @@ mod tests {
         let mut reader = BlockReader::new(file)?;
 
         // This should now work without error
-        let read_record: TestRecord = reader.read_record(offset)?;
-        assert_eq!(record, read_record);
+        let read_record: TestRecord = reader.read_record(offset)?.2;
+        assert_eq!(record.2, read_record);
 
         Ok(())
     }

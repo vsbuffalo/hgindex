@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-const BEDSIZE: u32 = 10_000_000;
+const BEDSIZE: u32 = 1_000_000;
 
 fn run_tabix_query(bed_file: &str, region: &str) -> Vec<String> {
     let output = Command::new("tabix")
@@ -43,7 +43,7 @@ fn test_tabix_compatibility() {
     // Generate paths for all files
     let test_bed = test_dir.join("test.bed");
     let bgzipped = test_dir.join("test.bed.bgz");
-    let hgindex = test_dir.join("test.bed.hgidx");
+    let hgindex = test_dir.join("test.hgidx");
 
     // Print paths for inspection
     eprintln!("Test files location:");

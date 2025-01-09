@@ -147,7 +147,7 @@ where
 
     /// Read a single record at the provided virtual offset (even if it spans multiple
     /// compressed blocks).
-    pub fn read_record(&mut self, voffset: VirtualOffset) -> Result<T, HgIndexError>
+    pub fn read_record(&mut self, voffset: VirtualOffset) -> Result<(u32, u32, T), HgIndexError>
     where
         T: for<'de> serde::Deserialize<'de> + std::fmt::Debug,
     {
@@ -174,24 +174,24 @@ where
 
         let record_bytes = self.read_bytes(record_voffset, record_length)?;
 
-        // Debug logging
-        if record_bytes.len() >= 4 && record_bytes[0] != 4 {
-            eprintln!("WARNING: Unexpected byte pattern at start of record:");
-            eprintln!(
-                "Virtual offset: file={}, block={}",
-                voffset.file_offset(),
-                voffset.block_offset()
-            );
-            eprintln!("Record length: {}", record_length);
-            eprintln!(
-                "First 8 bytes: {:?}",
-                &record_bytes[..8.min(record_bytes.len())]
-            );
-            eprintln!("All bytes: {:?}", record_bytes);
-            if let Ok(s) = std::str::from_utf8(&record_bytes) {
-                eprintln!("As string: {:?}", s);
-            }
-        }
+        // // Debug logging - TODO remove
+        // if record_bytes.len() >= 4 && record_bytes[0] != 4 {
+        //     eprintln!("WARNING: Unexpected byte pattern at start of record:");
+        //     eprintln!(
+        //         "Virtual offset: file={}, block={}",
+        //         voffset.file_offset(),
+        //         voffset.block_offset()
+        //     );
+        //     eprintln!("Record length: {}", record_length);
+        //     eprintln!(
+        //         "First 8 bytes: {:?}",
+        //         &record_bytes[..8.min(record_bytes.len())]
+        //     );
+        //     eprintln!("All bytes: {:?}", record_bytes);
+        //     if let Ok(s) = std::str::from_utf8(&record_bytes) {
+        //         eprintln!("As string: {:?}", s);
+        //     }
+        // }
 
         // Deserialize
         bincode::deserialize(&record_bytes).map_err(|e| {

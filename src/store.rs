@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     block::{BlockReader, BlockWriter, VirtualOffset},
     error::HgIndexError,
-    index::{BinningIndex, BinningSchema, Chunk},
-    HierarchicalBins, SerdeType,
+    index::{BinningIndex, BinningSchema},
+    SerdeType,
 };
 
 #[derive(Debug)]
@@ -36,7 +36,7 @@ where
         })
     }
 
-    pub fn read_at(&mut self, voffset: VirtualOffset) -> Result<T, HgIndexError> {
+    pub fn read_at(&mut self, voffset: VirtualOffset) -> Result<(u32, u32, T), HgIndexError> {
         self.reader.read_record(voffset)
     }
 }
@@ -54,18 +54,20 @@ impl ChromosomeWriter {
         })
     }
 
-    pub fn write_record<T: Serialize>(
+    pub fn write_record<T: Serialize + std::fmt::Debug>(
         &mut self,
+        start: u32,
+        end: u32,
         record: &T,
     ) -> Result<VirtualOffset, HgIndexError> {
-        self.writer.add_record(record)
+        self.writer.add_record(&(start, end, record))
     }
 }
 
 pub struct GenomicDataStore<T, M>
 where
     T: SerdeType + std::fmt::Debug,
-    M: SerdeType,
+    M: SerdeType + std::fmt::Debug,
 {
     directory: PathBuf,
     index: Option<BinningIndex<M>>,
@@ -81,7 +83,11 @@ where
     _phantom: PhantomData<T>,
 }
 
-impl<T: SerdeType + std::fmt::Debug, M: SerdeType> GenomicDataStore<T, M> {
+impl<T, M> GenomicDataStore<T, M>
+where
+    T: SerdeType + std::fmt::Debug,
+    M: SerdeType + std::fmt::Debug,
+{
     pub fn create(directory: &Path, key: Option<String>) -> io::Result<Self> {
         Self::create_with_schema(directory, key, &BinningSchema::default())
     }
@@ -206,7 +212,7 @@ impl<T: SerdeType + std::fmt::Debug, M: SerdeType> GenomicDataStore<T, M> {
 
         // Write record and get its offset
         let writer = self.get_or_create_writer(chrom)?;
-        let offset = writer.write_record(record)?;
+        let offset = writer.write_record(start, end, record)?;
 
         // Store coordinates and offset for indexing phase
         self.coordinates
@@ -222,68 +228,8 @@ impl<T: SerdeType + std::fmt::Debug, M: SerdeType> GenomicDataStore<T, M> {
 
         // Process each chromosome's coordinates
         for (chrom, coords) in &self.coordinates {
-            let mut sorted_coords = coords.clone();
-            sorted_coords.sort_by_key(|(start, _, _)| *start);
-
-            // Track current chunk being built
-            let mut current_bin = None;
-            let mut chunk_start: Option<VirtualOffset> = None;
-            let mut last_offset: Option<VirtualOffset> = None;
-
-            for (start, end, offset) in sorted_coords {
-                let binning = HierarchicalBins::from_schema(&self.schema);
-                let bin_id = binning.region_to_bin(start, end);
-
-                match (current_bin, chunk_start, last_offset) {
-                    // If bin changes or offset gap is large, end chunk and start new one
-                    (Some(b), Some(c_start), Some(l_off))
-                        if b != bin_id || offset.value - l_off.value > 16384 =>
-                    {
-                        // Add completed chunk
-                        let chunk = Chunk {
-                            start_offset: c_start.value,
-                            end_offset: l_off.value,
-                        };
-                        let seq_index = index.sequences.entry(chrom.to_string()).or_default();
-                        seq_index.bins.entry(b).or_default().push(chunk);
-
-                        // Start new chunk
-                        current_bin = Some(bin_id);
-                        chunk_start = Some(offset);
-                    }
-                    (None, None, None) => {
-                        // First feature starts a new chunk
-                        current_bin = Some(bin_id);
-                        chunk_start = Some(offset);
-                    }
-                    _ => {}
-                }
-
-                // Update linear index
-                let seq_index = index.sequences.entry(chrom.to_string()).or_default();
-                let start_window = start >> binning.linear_shift;
-                let end_window = (end - 1) >> binning.linear_shift;
-                if end_window >= seq_index.linear_index.len() as u32 {
-                    seq_index
-                        .linear_index
-                        .resize(end_window as usize + 1, u64::MAX);
-                }
-                for window in start_window..=end_window {
-                    seq_index.linear_index[window as usize] =
-                        seq_index.linear_index[window as usize].min(offset.value);
-                }
-
-                last_offset = Some(offset);
-            }
-
-            // Add final chunk if exists
-            if let (Some(bin), Some(start), Some(last)) = (current_bin, chunk_start, last_offset) {
-                let chunk = Chunk {
-                    start_offset: start.value,
-                    end_offset: last.value,
-                };
-                let seq_index = index.sequences.entry(chrom.to_string()).or_default();
-                seq_index.bins.entry(bin).or_default().push(chunk);
+            for (start, end, offset) in coords {
+                index.add_feature(chrom, *start, *end, (*offset).into());
             }
         }
 
@@ -304,7 +250,7 @@ impl<T: SerdeType + std::fmt::Debug, M: SerdeType> GenomicDataStore<T, M> {
         self.index()?;
 
         // Write index to disk
-        if let Some(index) = &self.index {
+        if let Some(index) = &mut self.index {
             let index_path = if let Some(ref key) = self.key {
                 self.directory.join(key).join("index.bin")
             } else {
@@ -352,7 +298,10 @@ impl<T: SerdeType + std::fmt::Debug, M: SerdeType> GenomicDataStore<T, M> {
 
         let mut results = Vec::new();
         for offset in offsets {
-            results.push(reader.read_at(offset.into())?);
+            let (record_start, record_end, record) = reader.read_at(offset.into())?;
+            if record_start < end && record_end > start {
+                results.push(record);
+            }
         }
 
         Ok(results)
