@@ -19,7 +19,7 @@ pub struct BinningIndex<M>
 where
     M: SerdeType,
 {
-    binning: BinningSchema,
+    pub schema: BinningSchema,
     pub sequences: IndexMap<String, SequenceIndex>,
     pub metadata: Option<M>,
     pub use_linear_index: bool,
@@ -48,7 +48,7 @@ where
 
         // Convert helper into our actual type
         Ok(BinningIndex {
-            binning: helper.binning,
+            schema: helper.binning,
             sequences: helper.sequences,
             metadata: helper.metadata,
             use_linear_index: helper.use_linear_index,
@@ -62,9 +62,15 @@ where
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SequenceIndex {
     // Map from bin ID to list of features in that bin
-    pub bins: IndexMap<u32, Vec<Feature>>,
+    pub bins: IndexMap<u32, Vec<Chunk>>,
     // Linear index for quick region queries
     pub linear_index: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Chunk {
+    pub start_offset: u64, // Virtual offset where chunk starts
+    pub end_offset: u64,   // Virtual offset where chunk ends
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -86,7 +92,7 @@ impl<M: SerdeType> Default for BinningIndex<M> {
 impl<M: SerdeType> BinningIndex<M> {
     pub fn new() -> Self {
         BinningIndex {
-            binning: BinningSchema::default(),
+            schema: BinningSchema::default(),
             sequences: IndexMap::new(),
             metadata: None,
             use_linear_index: true,
@@ -95,7 +101,7 @@ impl<M: SerdeType> BinningIndex<M> {
 
     pub fn from_schema(schema: &BinningSchema) -> Self {
         BinningIndex {
-            binning: schema.clone(),
+            schema: schema.clone(),
             sequences: IndexMap::new(),
             metadata: None,
             use_linear_index: true,
@@ -123,40 +129,54 @@ impl<M: SerdeType> BinningIndex<M> {
     }
 
     /// Add a feature, a range with a file
-    pub fn add_feature(&mut self, chrom: &str, start: u32, end: u32, index: u64) {
-        let binning = HierarchicalBins::from_schema(&self.binning);
+    pub fn add_feature(&mut self, chrom: &str, start: u32, end: u32, offset: u64) {
+        let binning = HierarchicalBins::from_schema(&self.schema);
         let bin_id = binning.region_to_bin(start, end);
 
-        let bin_index = self.sequences.entry(chrom.to_string()).or_default();
-        let feature = Feature { start, end, index };
-        bin_index.bins.entry(bin_id).or_default().push(feature);
+        let seq_index = self.sequences.entry(chrom.to_string()).or_default();
 
-        // Update linear index for ALL windows this feature overlaps
+        // Get or create chunks for this bin
+        let chunks = seq_index.bins.entry(bin_id).or_default();
+
+        match chunks.last_mut() {
+            // If we have a chunk and this feature is close enough, extend it
+            Some(chunk) if offset - chunk.end_offset <= 16384 => {
+                chunk.end_offset = offset;
+            }
+            // Otherwise start a new chunk
+            _ => {
+                chunks.push(Chunk {
+                    start_offset: offset,
+                    end_offset: offset,
+                });
+            }
+        }
+
+        // Update linear index
         let start_window = start >> binning.linear_shift;
         let end_window = (end - 1) >> binning.linear_shift; // -1 because end is exclusive
 
-        if end_window >= bin_index.linear_index.len() as u32 {
-            bin_index
+        if end_window >= seq_index.linear_index.len() as u32 {
+            seq_index
                 .linear_index
                 .resize(end_window as usize + 1, u64::MAX);
         }
 
         for window in start_window..=end_window {
-            bin_index.linear_index[window as usize] =
-                bin_index.linear_index[window as usize].min(index);
+            seq_index.linear_index[window as usize] =
+                seq_index.linear_index[window as usize].min(offset);
         }
     }
 
-    /// Return the indices (e.g. file offsets) of all ranges that overlap with the supplied range.
     pub fn find_overlapping(&self, chrom: &str, start: u32, end: u32) -> Vec<u64> {
         let Some(chrom_index) = self.sequences.get(chrom) else {
             return vec![];
         };
 
-        let binning = HierarchicalBins::from_schema(&self.binning);
+        let binning = HierarchicalBins::from_schema(&self.schema);
         let bins_to_check = binning.region_to_bins(start, end);
 
-        let mut overlapping = Vec::new();
+        let mut chunks = Vec::new();
 
         // Calculate min_offset from all relevant linear index windows
         let min_offset = if self.use_linear_index {
@@ -170,22 +190,41 @@ impl<M: SerdeType> BinningIndex<M> {
             }
             min
         } else {
-            0 // When linear index is disabled, check all features
+            0 // When linear index is disabled, check all chunks
         };
 
+        // Collect relevant chunks from each bin
         for bin_id in bins_to_check {
-            if let Some(features) = chrom_index.bins.get(&bin_id) {
-                for feature in features {
-                    if feature.index >= min_offset && feature.start < end && feature.end > start {
-                        overlapping.push(feature.index);
+            if let Some(bin_chunks) = chrom_index.bins.get(&bin_id) {
+                for chunk in bin_chunks {
+                    if chunk.end_offset >= min_offset {
+                        chunks.push(chunk.clone());
                     }
                 }
             }
         }
 
-        overlapping.sort_unstable();
-        overlapping.dedup();
-        overlapping
+        // Sort and merge overlapping chunks
+        if !chunks.is_empty() {
+            chunks.sort_by_key(|c| c.start_offset);
+            let mut merged = vec![chunks[0].clone()];
+
+            for chunk in chunks.into_iter().skip(1) {
+                let last = merged.last_mut().unwrap();
+                if chunk.start_offset <= last.end_offset {
+                    // Extend existing chunk
+                    last.end_offset = last.end_offset.max(chunk.end_offset);
+                } else {
+                    // Add new chunk
+                    merged.push(chunk);
+                }
+            }
+
+            // Return the start offsets of chunks
+            merged.into_iter().map(|c| c.start_offset).collect()
+        } else {
+            vec![]
+        }
     }
 
     /// Write the BinningIndex to a path by binary serialization.

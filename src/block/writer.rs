@@ -60,7 +60,7 @@ impl BlockWriter {
         Ok(start_vo)
     }
 
-    fn flush_block(&mut self) -> Result<(), HgIndexError> {
+    pub fn flush_block(&mut self) -> Result<(), HgIndexError> {
         if self.buffer.is_empty() {
             return Ok(());
         }

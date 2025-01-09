@@ -12,7 +12,7 @@ const LENGTH_PREFIX_SIZE: usize = 8; // size of u64 length prefix in bytes
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VirtualOffset {
-    value: u64,
+    pub value: u64,
 }
 
 impl VirtualOffset {

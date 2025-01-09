@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     fs::{self, File},
+    io,
     marker::PhantomData,
     path::{Path, PathBuf},
 };
@@ -12,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     block::{BlockReader, BlockWriter, VirtualOffset},
     error::HgIndexError,
-    index::{BinningIndex, BinningSchema},
-    SerdeType,
+    index::{BinningIndex, BinningSchema, Chunk},
+    HierarchicalBins, SerdeType,
 };
 
 #[derive(Debug)]
@@ -61,22 +62,97 @@ impl ChromosomeWriter {
     }
 }
 
-#[derive(Debug)]
 pub struct GenomicDataStore<T, M>
 where
     T: SerdeType + std::fmt::Debug,
     M: SerdeType,
 {
-    index: BinningIndex<M>,
+    directory: PathBuf,
+    index: Option<BinningIndex<M>>,
     writers: HashMap<String, ChromosomeWriter>,
     readers: HashMap<String, ChromosomeReader<T>>,
-    directory: PathBuf,
+    schema: BinningSchema,
     key: Option<String>,
+    // For sort validation
+    last_chrom: Option<String>,
+    last_pos: Option<u32>,
+    // Store coordinates and offsets during writing
+    coordinates: HashMap<String, Vec<(u32, u32, VirtualOffset)>>,
     _phantom: PhantomData<T>,
 }
 
 impl<T: SerdeType + std::fmt::Debug, M: SerdeType> GenomicDataStore<T, M> {
-    const INDEX_FILENAME: &'static str = "index.bin";
+    pub fn create(directory: &Path, key: Option<String>) -> io::Result<Self> {
+        Self::create_with_schema(directory, key, &BinningSchema::default())
+    }
+
+    pub fn open(directory: &Path, key: Option<String>) -> Result<Self, HgIndexError> {
+        // Load existing index
+        let index_path = if let Some(ref key) = key {
+            directory.join(key).join("index.bin")
+        } else {
+            directory.join("index.bin")
+        };
+
+        let index = BinningIndex::open(&index_path)?;
+        let schema = index.schema.clone();
+
+        Ok(Self {
+            directory: directory.to_path_buf(),
+            index: Some(index),
+            writers: HashMap::new(),
+            readers: HashMap::new(),
+            schema,
+            key,
+            last_chrom: None,
+            last_pos: None,
+            coordinates: HashMap::new(),
+            _phantom: PhantomData,
+        })
+    }
+
+    // Metadata methods
+    pub fn metadata(&self) -> Option<&M> {
+        self.index.as_ref().and_then(|idx| idx.metadata.as_ref())
+    }
+
+    pub fn metadata_mut(&mut self) -> Option<&mut M> {
+        self.index.as_mut().and_then(|idx| idx.metadata.as_mut())
+    }
+
+    pub fn set_metadata(&mut self, metadata: M) {
+        if let Some(idx) = self.index.as_mut() {
+            idx.metadata = Some(metadata);
+        }
+    }
+
+    pub fn take_metadata(&mut self) -> Option<M> {
+        self.index.as_mut().and_then(|idx| idx.metadata.take())
+    }
+
+    pub fn create_with_schema(
+        directory: &Path,
+        key: Option<String>,
+        schema: &BinningSchema,
+    ) -> io::Result<Self> {
+        fs::create_dir_all(directory)?;
+        if let Some(ref key) = key {
+            fs::create_dir_all(directory.join(key))?;
+        }
+
+        Ok(Self {
+            directory: directory.to_path_buf(),
+            index: None,
+            writers: HashMap::new(),
+            readers: HashMap::new(),
+            schema: schema.clone(),
+            key,
+            last_chrom: None,
+            last_pos: None,
+            coordinates: HashMap::new(),
+            _phantom: PhantomData,
+        })
+    }
 
     fn get_data_path(&self, chrom: &str) -> PathBuf {
         let mut path = self.directory.clone();
@@ -86,89 +162,14 @@ impl<T: SerdeType + std::fmt::Debug, M: SerdeType> GenomicDataStore<T, M> {
         path.join(format!("{}.bin", chrom))
     }
 
-    pub fn create_with_schema(
-        directory: &Path,
-        key: Option<String>,
-        schema: &BinningSchema,
-    ) -> std::io::Result<Self> {
-        // Create base directory
-        fs::create_dir_all(directory)?;
-
-        // Create key subdirectory if needed
-        if let Some(ref key) = key {
-            fs::create_dir_all(directory.join(key))?;
-        }
-
-        Ok(Self {
-            index: BinningIndex::from_schema(schema),
-            writers: HashMap::new(),
-            readers: HashMap::new(),
-            directory: directory.to_path_buf(),
-            key,
-            _phantom: PhantomData,
-        })
-    }
-
-    pub fn create(directory: &Path, key: Option<String>) -> std::io::Result<Self> {
-        // Create base directory
-        fs::create_dir_all(directory)?;
-
-        // Create key subdirectory if needed
-        if let Some(ref key) = key {
-            fs::create_dir_all(directory.join(key))?;
-        }
-
-        Ok(Self {
-            index: BinningIndex::new(),
-            writers: HashMap::new(),
-            readers: HashMap::new(),
-            directory: directory.to_path_buf(),
-            key,
-            _phantom: PhantomData,
-        })
-    }
-
     fn get_or_create_writer(&mut self, chrom: &str) -> Result<&mut ChromosomeWriter, HgIndexError> {
         if !self.writers.contains_key(chrom) {
             let path = self.get_data_path(chrom);
-            // Need to create parent directories here!
-            std::fs::create_dir_all(path.parent().unwrap())?; // <-- Add this
-            let writer = ChromosomeWriter::new(path.to_str().unwrap())?;
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            let writer = ChromosomeWriter::new(path)?;
             self.writers.insert(chrom.to_string(), writer);
         }
         Ok(self.writers.get_mut(chrom).unwrap())
-    }
-
-    fn get_or_create_reader(
-        &mut self,
-        chrom: &str,
-    ) -> Result<&mut ChromosomeReader<T>, HgIndexError> {
-        if !self.readers.contains_key(chrom) {
-            let path = self.get_data_path(chrom);
-            let reader = ChromosomeReader::new(path.to_str().unwrap())?;
-            self.readers.insert(chrom.to_string(), reader);
-        }
-        Ok(self.readers.get_mut(chrom).unwrap())
-    }
-
-    // Add these methods to your existing impl block
-    pub fn metadata(&self) -> Option<&M> {
-        self.index.metadata.as_ref()
-    }
-
-    /// Get a mutable reference to the store's metadata
-    pub fn metadata_mut(&mut self) -> Option<&mut M> {
-        self.index.metadata.as_mut()
-    }
-
-    /// Set the store's metadata
-    pub fn set_metadata(&mut self, metadata: M) {
-        self.index.metadata = Some(metadata);
-    }
-
-    /// Take ownership of the metadata, leaving None in its place
-    pub fn take_metadata(&mut self) -> Option<M> {
-        self.index.metadata.take()
     }
 
     pub fn add_record(
@@ -178,60 +179,155 @@ impl<T: SerdeType + std::fmt::Debug, M: SerdeType> GenomicDataStore<T, M> {
         end: u32,
         record: &T,
     ) -> Result<(), HgIndexError> {
-        // Check for zero-length features
-        if start >= end {
+        // Validate coordinates
+        if end <= start {
             return Err(HgIndexError::ZeroLengthFeature(start, end));
         }
 
-        let store = self.get_or_create_writer(chrom)?;
-        // Add the record to the block-compressed writer for this chromosome.
-        let virtual_offset = store.writer.add_record(&record)?;
-        // Add the feature to the index now.
-        self.index
-            .add_feature(chrom, start, end, virtual_offset.into());
-        Ok(())
-    }
-
-    pub fn finalize(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        // Finish each writer explicitly before clearing
-        for (_, writer) in self.writers.drain() {
-            writer.writer.finish()?;
+        // Validate sorting
+        match (self.last_chrom.as_ref(), self.last_pos) {
+            (Some(last_chrom), Some(last_pos)) => match last_chrom.as_str().cmp(chrom) {
+                std::cmp::Ordering::Greater => {
+                    return Err(HgIndexError::from("Records must be sorted by chromosome"));
+                }
+                std::cmp::Ordering::Equal if start < last_pos => {
+                    return Err(HgIndexError::from(
+                        "Records must be sorted by position within chromosome",
+                    ));
+                }
+                _ => {}
+            },
+            _ => {}
         }
 
-        let index_path = if let Some(ref key) = self.key {
-            self.directory.join(key).join(Self::INDEX_FILENAME)
-        } else {
-            self.directory.join(Self::INDEX_FILENAME)
-        };
+        // Update last position
+        self.last_chrom = Some(chrom.to_string());
+        self.last_pos = Some(start);
 
-        self.index.write(index_path.as_path())?;
+        // Write record and get its offset
+        let writer = self.get_or_create_writer(chrom)?;
+        let offset = writer.write_record(record)?;
+
+        // Store coordinates and offset for indexing phase
+        self.coordinates
+            .entry(chrom.to_string())
+            .or_default()
+            .push((start, end, offset));
+
         Ok(())
     }
 
-    pub fn open(
-        directory: &Path,
-        key: Option<String>,
-    ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        // Keep original path
-        let index_path = if let Some(ref key) = key {
-            directory.join(key).join(Self::INDEX_FILENAME)
-        } else {
-            directory.join(Self::INDEX_FILENAME)
-        };
+    fn index(&mut self) -> Result<(), HgIndexError> {
+        let mut index = BinningIndex::from_schema(&self.schema);
 
-        let index = BinningIndex::open(&index_path)?;
+        // Process each chromosome's coordinates
+        for (chrom, coords) in &self.coordinates {
+            let mut sorted_coords = coords.clone();
+            sorted_coords.sort_by_key(|(start, _, _)| *start);
 
-        Ok(Self {
-            index,
-            directory: directory.to_path_buf(), // Use original directory
-            writers: HashMap::new(),
-            readers: HashMap::new(),
-            key,
-            _phantom: PhantomData,
-        })
+            // Track current chunk being built
+            let mut current_bin = None;
+            let mut chunk_start: Option<VirtualOffset> = None;
+            let mut last_offset: Option<VirtualOffset> = None;
+
+            for (start, end, offset) in sorted_coords {
+                let binning = HierarchicalBins::from_schema(&self.schema);
+                let bin_id = binning.region_to_bin(start, end);
+
+                match (current_bin, chunk_start, last_offset) {
+                    // If bin changes or offset gap is large, end chunk and start new one
+                    (Some(b), Some(c_start), Some(l_off))
+                        if b != bin_id || offset.value - l_off.value > 16384 =>
+                    {
+                        // Add completed chunk
+                        let chunk = Chunk {
+                            start_offset: c_start.value,
+                            end_offset: l_off.value,
+                        };
+                        let seq_index = index.sequences.entry(chrom.to_string()).or_default();
+                        seq_index.bins.entry(b).or_default().push(chunk);
+
+                        // Start new chunk
+                        current_bin = Some(bin_id);
+                        chunk_start = Some(offset);
+                    }
+                    (None, None, None) => {
+                        // First feature starts a new chunk
+                        current_bin = Some(bin_id);
+                        chunk_start = Some(offset);
+                    }
+                    _ => {}
+                }
+
+                // Update linear index
+                let seq_index = index.sequences.entry(chrom.to_string()).or_default();
+                let start_window = start >> binning.linear_shift;
+                let end_window = (end - 1) >> binning.linear_shift;
+                if end_window >= seq_index.linear_index.len() as u32 {
+                    seq_index
+                        .linear_index
+                        .resize(end_window as usize + 1, u64::MAX);
+                }
+                for window in start_window..=end_window {
+                    seq_index.linear_index[window as usize] =
+                        seq_index.linear_index[window as usize].min(offset.value);
+                }
+
+                last_offset = Some(offset);
+            }
+
+            // Add final chunk if exists
+            if let (Some(bin), Some(start), Some(last)) = (current_bin, chunk_start, last_offset) {
+                let chunk = Chunk {
+                    start_offset: start.value,
+                    end_offset: last.value,
+                };
+                let seq_index = index.sequences.entry(chrom.to_string()).or_default();
+                seq_index.bins.entry(bin).or_default().push(chunk);
+            }
+        }
+
+        self.index = Some(index);
+        Ok(())
     }
 
-    /// The features overlapping the range with this start and end position.
+    pub fn finalize(&mut self) -> Result<(), HgIndexError> {
+        // First flush all writers
+        for writer in self.writers.values_mut() {
+            writer.writer.flush_block()?;
+        }
+
+        // Clear writers
+        self.writers.clear();
+
+        // Build and save the index
+        self.index()?;
+
+        // Write index to disk
+        if let Some(index) = &self.index {
+            let index_path = if let Some(ref key) = self.key {
+                self.directory.join(key).join("index.bin")
+            } else {
+                self.directory.join("index.bin")
+            };
+            index.write(&index_path)?;
+        }
+
+        Ok(())
+    }
+
+    fn get_or_create_reader(
+        &mut self,
+        chrom: &str,
+    ) -> Result<&mut ChromosomeReader<T>, HgIndexError> {
+        if !self.readers.contains_key(chrom) {
+            let path = self.get_data_path(chrom);
+            let reader = ChromosomeReader::new(path)?;
+            self.readers.insert(chrom.to_string(), reader);
+        }
+        Ok(self.readers.get_mut(chrom).unwrap())
+    }
+
     pub fn get_overlapping(
         &mut self,
         chrom: &str,
@@ -241,31 +337,23 @@ impl<T: SerdeType + std::fmt::Debug, M: SerdeType> GenomicDataStore<T, M> {
         if end <= start {
             return Err(HgIndexError::InvalidInterval { start, end });
         }
-        // Early return empty vec if chromosome not in index
-        if !self.index.sequences.contains_key(chrom) {
+
+        let index = self
+            .index
+            .as_ref()
+            .ok_or_else(|| HgIndexError::from("Index not built yet"))?;
+
+        let offsets = index.find_overlapping(chrom, start, end);
+        if offsets.is_empty() {
             return Ok(Vec::new());
         }
+
+        let reader = self.get_or_create_reader(chrom)?;
+
         let mut results = Vec::new();
-
-        // Early return if chromosome not in index
-        if !self.index.sequences.contains_key(chrom) {
-            return Ok(results);
+        for offset in offsets {
+            results.push(reader.read_at(offset.into())?);
         }
-
-        let voffsets = self.index.find_overlapping(chrom, start, end);
-        // eprintln!("voffsets found = {}", voffsets.len());
-
-        // Open chromosome file if not already open, returning empty results
-        // if the chromosome is not found (assumed to mean no records for that
-        // chromosome).
-        match self.get_or_create_reader(chrom) {
-            Ok(reader) => {
-                for voffset in voffsets {
-                    results.push(reader.read_at(voffset.into())?);
-                }
-            }
-            Err(_) => return Ok(results),
-        };
 
         Ok(results)
     }

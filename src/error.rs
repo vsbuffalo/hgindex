@@ -10,6 +10,9 @@ pub enum HgIndexError {
     #[error("Invalid interval: end ({end}) must be greater than start ({start})")]
     InvalidInterval { start: u32, end: u32 },
 
+    #[error("GenomicDataStore has already been finalized.")]
+    AlreadyFinalized,
+
     #[error("IO error: {0}")]
     IOError(#[from] std::io::Error),
 
