@@ -5,8 +5,8 @@ pub mod random_bed {
     use crate::commands::BedRecord;
     use clap::Args;
     use hgindex::error::HgIndexError;
-    use hgindex::io::io::OutputFile;
-    use rand::{seq::SliceRandom, Rng};
+    use hgindex::io::io::OutputStream;
+    use rand::{seq::SliceRandom, Rng, SeedableRng};
     use std::io::Write;
     use std::path::PathBuf;
 
@@ -14,21 +14,27 @@ pub mod random_bed {
     pub struct RandomBedArgs {
         /// Output file path (.bed or .bed.gz)
         #[arg(short, long)]
-        pub output: PathBuf,
+        pub output: Option<PathBuf>,
 
         /// Number of records to generate
         #[arg(short = 'n', long, default_value = "1000000")]
         pub num_records: usize,
+
+        /// Optional seed for random number generation
+        #[arg(short, long)]
+        pub seed: Option<u64>,
     }
 
     pub fn run(args: RandomBedArgs) -> Result<(), HgIndexError> {
         eprintln!(
             "Generating {} random BED records to {}",
             args.num_records,
-            args.output.display()
+            args.output
+                .as_ref()
+                .map_or("<stdout>".to_string(), |v| v.to_string_lossy().to_string())
         );
 
-        let output = OutputFile::new(&args.output);
+        let output = OutputStream::new(args.output);
         let mut writer = output.writer()?;
 
         //// Write header comments
@@ -40,7 +46,7 @@ pub mod random_bed {
         //)?;
 
         // Generate and write records
-        let records = generate_random_bed_records(args.num_records);
+        let records = generate_random_bed_records(args.num_records, args.seed);
         for record in records {
             writeln!(writer, "{}", record.to_string())?;
         }
@@ -49,7 +55,7 @@ pub mod random_bed {
         Ok(())
     }
 
-    fn generate_random_bed_records(num_records: usize) -> Vec<BedRecord> {
+    fn generate_random_bed_records(num_records: usize, seed: Option<u64>) -> Vec<BedRecord> {
         const CHROMS: &[&str] = &["chr1", "chr2", "chr3", "chr4", "chr5", "chrX", "chrY"];
         const FEATURE_TYPES: &[&str] = &[
             "gene",
@@ -64,7 +70,11 @@ pub mod random_bed {
             "methylation",
         ];
 
-        let mut rng = rand::thread_rng();
+        let mut rng = match seed {
+            Some(s) => rand::rngs::StdRng::seed_from_u64(s),
+            None => rand::rngs::StdRng::from_entropy(),
+        };
+
         let mut records = Vec::with_capacity(num_records);
 
         for _ in 0..num_records {
@@ -73,7 +83,9 @@ pub mod random_bed {
 
         records.sort_by(|a, b| {
             let chrom_cmp = compare_chromosomes(&a.chrom, &b.chrom);
-            chrom_cmp.then(a.start.cmp(&b.start))
+            chrom_cmp
+                .then(a.start.cmp(&b.start))
+                .then(a.end.cmp(&b.end))
         });
 
         records
@@ -139,12 +151,11 @@ pub mod random_bed {
         use tempfile::NamedTempFile;
 
         #[test]
-        fn test_bed_record_generation() {
-            let mut rng = rand::thread_rng();
-            let record = generate_single_record(&mut rng, &["chr1", "chr2"], &["gene", "exon"]);
-
-            assert!(record.chrom.starts_with("chr"));
-            assert!(record.end > record.start);
+        fn test_reproducible_generation() {
+            let seed = 42;
+            let records1 = generate_random_bed_records(100, Some(seed));
+            let records2 = generate_random_bed_records(100, Some(seed));
+            assert_eq!(records1, records2);
         }
 
         #[test]

@@ -8,19 +8,21 @@ use std::{
 
 use crate::SerdeType;
 
-use super::binning::HierarchicalBins;
+use super::binning::{BinningSchema, HierarchicalBins};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 /// BinningIndex is the sequence-level (e.g. chromosome) container
 /// for SequenceIndex objects that index the features.
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct BinningIndex<M>
 where
     M: SerdeType,
 {
+    binning: BinningSchema,
     pub sequences: IndexMap<String, SequenceIndex>,
     pub metadata: Option<M>,
+    pub use_linear_index: bool,
 }
 
 // Implement Deserialize manually to handle the lifetime bounds correctly
@@ -32,17 +34,24 @@ where
     where
         D: serde::Deserializer<'de>,
     {
-        // Create a temporary struct for deriving
+        // Helper struct has same fields but can derive Deserialize
         #[derive(Deserialize)]
         struct BinningIndexHelper<M> {
+            binning: BinningSchema,
             sequences: IndexMap<String, SequenceIndex>,
             metadata: Option<M>,
+            use_linear_index: bool,
         }
 
+        // Deserialize into the helper struct
         let helper = BinningIndexHelper::deserialize(deserializer)?;
+
+        // Convert helper into our actual type
         Ok(BinningIndex {
+            binning: helper.binning,
             sequences: helper.sequences,
             metadata: helper.metadata,
+            use_linear_index: helper.use_linear_index,
         })
     }
 }
@@ -50,7 +59,7 @@ where
 /// SequenceIndex stores the bin indices to the features they
 /// contain fully.
 ///
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SequenceIndex {
     // Map from bin ID to list of features in that bin
     pub bins: IndexMap<u32, Vec<Feature>>,
@@ -58,14 +67,14 @@ pub struct SequenceIndex {
     pub linear_index: Vec<u64>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Feature {
     /// Start position.
-    start: u32,
+    pub start: u32,
     /// End position.
-    end: u32,
+    pub end: u32,
     /// The feature index (e.g. a file offset).
-    index: u64,
+    pub index: u64,
 }
 
 impl<M: SerdeType> Default for BinningIndex<M> {
@@ -77,9 +86,28 @@ impl<M: SerdeType> Default for BinningIndex<M> {
 impl<M: SerdeType> BinningIndex<M> {
     pub fn new() -> Self {
         BinningIndex {
+            binning: BinningSchema::default(),
             sequences: IndexMap::new(),
             metadata: None,
+            use_linear_index: true,
         }
+    }
+
+    pub fn from_schema(schema: &BinningSchema) -> Self {
+        BinningIndex {
+            binning: schema.clone(),
+            sequences: IndexMap::new(),
+            metadata: None,
+            use_linear_index: true,
+        }
+    }
+
+    pub fn disable_linear_index(&mut self) {
+        self.use_linear_index = false;
+    }
+
+    pub fn enable_linear_index(&mut self) {
+        self.use_linear_index = true;
     }
 
     /// Create a new index object by reading a binary serialized version of disk.
@@ -96,27 +124,27 @@ impl<M: SerdeType> BinningIndex<M> {
 
     /// Add a feature, a range with a file
     pub fn add_feature(&mut self, chrom: &str, start: u32, end: u32, index: u64) {
-        let binning = HierarchicalBins::default();
+        let binning = HierarchicalBins::from_schema(&self.binning);
         let bin_id = binning.region_to_bin(start, end);
 
-        // the chromosome-level index
         let bin_index = self.sequences.entry(chrom.to_string()).or_default();
-
-        // make the feature
         let feature = Feature { start, end, index };
-
-        // insert the feature
         bin_index.bins.entry(bin_id).or_default().push(feature);
 
-        // Update linear index
-        let linear_idx = start >> binning.linear_shift;
-        if linear_idx >= bin_index.linear_index.len() as u32 {
+        // Update linear index for ALL windows this feature overlaps
+        let start_window = start >> binning.linear_shift;
+        let end_window = (end - 1) >> binning.linear_shift; // -1 because end is exclusive
+
+        if end_window >= bin_index.linear_index.len() as u32 {
             bin_index
                 .linear_index
-                .resize(linear_idx as usize + 1, u64::MAX);
+                .resize(end_window as usize + 1, u64::MAX);
         }
-        bin_index.linear_index[linear_idx as usize] =
-            bin_index.linear_index[linear_idx as usize].min(index);
+
+        for window in start_window..=end_window {
+            bin_index.linear_index[window as usize] =
+                bin_index.linear_index[window as usize].min(index);
+        }
     }
 
     /// Return the indices (e.g. file offsets) of all ranges that overlap with the supplied range.
@@ -125,22 +153,24 @@ impl<M: SerdeType> BinningIndex<M> {
             return vec![];
         };
 
-        let binning = HierarchicalBins::default();
+        let binning = HierarchicalBins::from_schema(&self.binning);
         let bins_to_check = binning.region_to_bins(start, end);
 
         let mut overlapping = Vec::new();
 
-        // Use linear index to find minimum file offset to start checking
-        let min_offset = {
-            let linear_idx = start >> binning.linear_shift;
-            let max_linear_idx = chrom_index.linear_index.len();
-            if linear_idx < max_linear_idx as u32 {
-                chrom_index.linear_index[linear_idx as usize]
-            } else {
-                // If we're beyond the end of the linear index, there can't be any features
-                // that overlap this region, so return an empty vector
-                return vec![];
+        // Calculate min_offset from all relevant linear index windows
+        let min_offset = if self.use_linear_index {
+            let start_window = start >> binning.linear_shift;
+            let end_window = (end - 1) >> binning.linear_shift;
+            let max_window = chrom_index.linear_index.len() as u32;
+
+            let mut min = u64::MAX;
+            for window in start_window..=end_window.min(max_window - 1) {
+                min = min.min(chrom_index.linear_index[window as usize]);
             }
+            min
+        } else {
+            0 // When linear index is disabled, check all features
         };
 
         for bin_id in bins_to_check {
@@ -304,5 +334,49 @@ mod tests {
 
         let overlaps = index.find_overlapping("chr1", 199, 200);
         assert_eq!(overlaps, vec![1], "Should only match first feature");
+    }
+
+    #[test]
+    fn test_linear_index_edge_cases() {
+        let mut index = BinningIndex::<()>::new();
+
+        // Add features - mix of overlapping and non-overlapping
+        index.add_feature("chr1", 16000, 17000, 1); // Should overlap
+        index.add_feature("chr1", 15900, 16500, 2); // Should overlap
+        index.add_feature("chr1", 16300, 16400, 3); // Should overlap
+        index.add_feature("chr1", 15000, 16384, 4); // Should overlap
+        index.add_feature("chr1", 16384, 17000, 5); // Should overlap
+        index.add_feature("chr1", 15000, 16200, 6); // Should NOT overlap - ends before query
+        index.add_feature("chr1", 16500, 17000, 7); // Should NOT overlap - starts after query
+
+        // Query region
+        let query_start = 16300;
+        let query_end = 16400;
+
+        let mut overlaps_with_linear = index.find_overlapping("chr1", query_start, query_end);
+        overlaps_with_linear.sort();
+
+        // Just features 1-5 should overlap
+        let mut all_overlapping = vec![1, 2, 3, 4, 5];
+        all_overlapping.sort();
+
+        assert_eq!(
+            overlaps_with_linear,
+            all_overlapping,
+            "Expected overlapping features {:?} but got {:?}. Features 6 and 7 should NOT be included.", 
+            all_overlapping,
+            overlaps_with_linear
+        );
+
+        // Also verify same results with linear indexing disabled
+        index.disable_linear_index();
+        let mut overlaps_without_linear = index.find_overlapping("chr1", query_start, query_end);
+        overlaps_without_linear.sort();
+
+        assert_eq!(
+            overlaps_with_linear, overlaps_without_linear,
+            "Results differ with linear indexing disabled: {:?} vs {:?}",
+            overlaps_with_linear, overlaps_without_linear
+        );
     }
 }

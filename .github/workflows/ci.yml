@@ -19,6 +19,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install tabix and bgzip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tabix
+
       - name: Cache dependencies
         uses: actions/cache@v3
         with:

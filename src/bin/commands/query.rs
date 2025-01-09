@@ -4,7 +4,9 @@
 pub mod query {
     use crate::commands::BedRecord;
     use clap::Args;
+    use flate2::Compression;
     use hgindex::error::HgIndexError;
+    use hgindex::io::io::OutputStream;
     use hgindex::store::GenomicDataStore;
     use std::fs;
     use std::path::PathBuf;
@@ -12,8 +14,12 @@ pub mod query {
 
     #[derive(Args)]
     pub struct QueryArgs {
+        /// Output file.
+        #[arg(short, long, value_name = "overlaps.bed")]
+        pub output: Option<String>,
+
         /// The query region, in the format seqname:start-end where start and end are
-        /// 0-indexed, and end is right-exclusive.
+        /// 1-based inclusive coordinates (like tabix's region argument).
         #[arg(value_name = "chr17:7661779-7687538")]
         pub region: String,
 
@@ -27,6 +33,15 @@ pub mod query {
     pub fn run(args: QueryArgs) -> Result<(), HgIndexError> {
         // For timing the query operation
         let duration_start = Instant::now();
+
+        // Builder output file, possibly compressed
+        let output_stream = OutputStream::builder()
+            .filepath(args.output)
+            .buffer_size(256 * 1024)
+            .compression_level(None::<Compression>)
+            .build();
+
+        let mut output_writer = output_stream.writer()?;
 
         // Determine input path
         let input_path = match args.input {
@@ -55,8 +70,14 @@ pub mod query {
             return Err("Invalid region format. Expected start-end.".into());
         }
 
-        let start: u32 = coords[0].parse().map_err(|_| "Invalid start coordinate.")?;
-        let end: u32 = coords[1].parse().map_err(|_| "Invalid end coordinate.")?;
+        let tabix_start: u32 = coords[0].parse().map_err(|_| "Invalid start coordinate.")?;
+        let tabix_end: u32 = coords[1].parse().map_err(|_| "Invalid end coordinate.")?;
+
+        // Convert to 0-based exclusive coordinates
+        let start = tabix_start
+            .checked_sub(1)
+            .ok_or("Start coordinate must be greater than 0")?;
+        let end = tabix_end; // End remains the same as it's exclusive in 0-based
 
         // Query the store for the region
         let records = store.get_overlapping(seqname, start, end)?;
@@ -65,7 +86,7 @@ pub mod query {
         // Output the records
         // TODO - add more features?
         for record in records {
-            println!("{}", record);
+            writeln!(output_writer, "{}", record)?;
         }
 
         let duration = duration_start.elapsed();

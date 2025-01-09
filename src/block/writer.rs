@@ -37,32 +37,25 @@ impl BlockWriter {
             .map_err(|e| HgIndexError::SerializationError(e.to_string()))?;
         let length = record_data.len() as u64;
 
-        // Check if we have enough room for the ENTIRE length prefix
-        if self.current_block_size + super::LENGTH_PREFIX_SIZE > BLOCK_SIZE {
+        // Calculate total space needed for this record
+        let total_space_needed = super::LENGTH_PREFIX_SIZE + record_data.len();
+
+        // If this record cannot fit in the current block as a whole, flush first
+        if self.current_block_size + total_space_needed > BLOCK_SIZE {
             self.flush_block()?;
         }
 
-        // Save starting position after potential flush but before writing
+        // Save starting position for virtual offset
         let start_vo = VirtualOffset::new(self.current_file_offset, self.current_block_size as u16);
 
-        // Now we know the full length prefix will fit in this block
+        // Write length prefix
         let length_bytes = length.to_le_bytes();
         self.buffer.extend_from_slice(&length_bytes);
         self.current_block_size += length_bytes.len();
 
-        // Write record data (this can span blocks as needed)
-        let mut bytes_written = 0;
-        while bytes_written < record_data.len() {
-            if self.current_block_size >= BLOCK_SIZE {
-                self.flush_block()?;
-            }
-            let can_write =
-                (BLOCK_SIZE - self.current_block_size).min(record_data.len() - bytes_written);
-            self.buffer
-                .extend_from_slice(&record_data[bytes_written..bytes_written + can_write]);
-            self.current_block_size += can_write;
-            bytes_written += can_write;
-        }
+        // Write record data
+        self.buffer.extend_from_slice(&record_data);
+        self.current_block_size += record_data.len();
 
         Ok(start_vo)
     }

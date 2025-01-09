@@ -1,3 +1,7 @@
+#[cfg(feature = "cli")]
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
+
 /// index/binning.rs
 ///
 /// # Hierarchical Binning
@@ -50,7 +54,7 @@
 ///
 ///
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HierarchicalBins {
     /// For hierarchical bins (17 = 128kb)
     pub base_shift: u32,
@@ -68,16 +72,7 @@ pub struct HierarchicalBins {
 
 impl Default for HierarchicalBins {
     fn default() -> Self {
-        let levels = calc_level_sizes(3, 5);
-        let bin_offsets = calc_offsets_from_levels(&levels);
-        HierarchicalBins {
-            base_shift: 17, // 128kb bins
-            level_shift: 3, // 8x scaling
-            num_levels: 5,
-            levels,
-            bin_offsets,
-            linear_shift: 14, // 16kb linear bins
-        }
+        Self::tabix()
     }
 }
 
@@ -88,7 +83,6 @@ pub fn calc_level_sizes(next_shift: u32, nlevels: usize) -> Vec<u32> {
         let level = 1u32 << (next_shift * i as u32);
         level_bins.push(level);
     }
-    // dbg!(&level_bins);
     level_bins
 }
 
@@ -115,6 +109,16 @@ pub fn calc_offsets(next_shift: u32, nlevels: usize) -> Vec<u32> {
     calc_offsets_from_levels(&level_bins)
 }
 
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Clone)]
+#[cfg_attr(feature = "cli", derive(ValueEnum))]
+pub enum BinningSchema {
+    Dense,
+    Sparse,
+    #[default]
+    Tabix,
+    Ucsc,
+}
+
 impl HierarchicalBins {
     // Create a new binning scheme with custom parameters
     pub fn new(base_shift: u32, level_shift: u32, num_levels: usize, linear_shift: u32) -> Self {
@@ -130,9 +134,30 @@ impl HierarchicalBins {
         }
     }
 
+    pub fn from_schema(schema: &BinningSchema) -> Self {
+        match schema {
+            BinningSchema::Ucsc => Self::ucsc(),
+            BinningSchema::Tabix => Self::tabix(),
+            BinningSchema::Dense => Self::dense(),
+            BinningSchema::Sparse => Self::sparse(),
+        }
+    }
+
     // Create the classic UCSC configuration
     pub fn ucsc() -> Self {
         Self::new(17, 3, 5, 14) // 128kb base bins, 8x scaling, 5 levels, 16kb linear bins
+    }
+
+    // Add this method
+    pub fn tabix() -> Self {
+        Self {
+            base_shift: 14,                  // Start with 16kb bins (2^14)
+            level_shift: 3,                  // 8x scaling (2^3)
+            num_levels: 6,                   // 6 levels to reach larger bins
+            levels: calc_level_sizes(3, 6),  // Calculate bins per level
+            bin_offsets: calc_offsets(3, 6), // Calculate offsets [4681,585,73,9,1,0]
+            linear_shift: 14,                // 16kb linear index (same as UCSC)
+        }
     }
 
     // Create a denser binning scheme for higher resolution
@@ -166,6 +191,7 @@ impl HierarchicalBins {
 
         panic!("start {}, end {} out of range in region_to_bin", start, end);
     }
+
     /// Find all bins that could contain features overlapping this range [start, end).
     /// This is used when searching for overlaps, as we need to check multiple bins
     /// across different levels.
@@ -174,7 +200,7 @@ impl HierarchicalBins {
         let mut start_bin = start;
         let mut end_bin = end - 1; // Exclusive end, so subtract 1 (internally it's inclusive)
 
-        // First shift with the initial shift amount (17 by default)
+        // First shift with the initial shift amount
         start_bin >>= self.base_shift;
         end_bin >>= self.base_shift;
 
@@ -190,11 +216,12 @@ impl HierarchicalBins {
             }
 
             // Early exit if we've reached a level where start and end are in the same bin
-            if start_bin == end_bin {
-                break;
-            }
+            // TODO: BUG
+            //if start_bin == end_bin {
+            //    break;
+            //}
 
-            // Shift to next level (dividing by 8, equivalent to right shift by 3)
+            // Shift to next level (right shift by the level_shift)
             start_bin >>= self.level_shift;
             end_bin >>= self.level_shift;
         }
@@ -219,7 +246,6 @@ mod tests {
     #[test]
     fn test_ucsc_offsets() {
         let offsets = calc_offsets(3, 5);
-        dbg!(&offsets);
         assert_eq!(offsets, vec![585, 73, 9, 1, 0]);
     }
 
@@ -280,7 +306,7 @@ mod tests {
 
     #[test]
     fn test_region_to_bin() {
-        let index = HierarchicalBins::default();
+        let index = HierarchicalBins::ucsc();
 
         // Test cases from UCSC example in documentation:
         // "100_000_000 >> 17" gives bin 762

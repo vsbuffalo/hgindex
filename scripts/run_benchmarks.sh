@@ -1,12 +1,13 @@
 #!/bin/bash
 set -e
 
+BEDSIZE=5000000
 mkdir -p data
 
 # Ensure we have our test data
 if [ ! -f "data/test.bed" ]; then
     echo "Generating test data..."
-    cargo run --release --features=cli,dev -- random-bed -o data/test.bed -n 1000000
+    cargo run --release --features=cli,dev -- random-bed -o data/test.bed -n $BEDSIZE
 fi
 
 # Create both compression versions
@@ -32,3 +33,4 @@ cargo run --release --features=cli -- pack -f data/test.bed -o data/test.bed.hgi
 echo "Running benchmarks..."
 # Make sure to update the benchmark code to use test.bed.bgz for tabix
 cargo bench --features=cli
+

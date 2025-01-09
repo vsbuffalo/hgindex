@@ -12,18 +12,21 @@ use serde::{Deserialize, Serialize};
 use crate::{
     block::{BlockReader, BlockWriter, VirtualOffset},
     error::HgIndexError,
-    index::BinningIndex,
+    index::{BinningIndex, BinningSchema},
     SerdeType,
 };
 
 #[derive(Debug)]
-pub struct ChromosomeReader<T> {
+pub struct ChromosomeReader<T>
+where
+    T: std::fmt::Debug,
+{
     reader: BlockReader<T>,
 }
 
 impl<T> ChromosomeReader<T>
 where
-    T: for<'de> Deserialize<'de>,
+    T: for<'de> Deserialize<'de> + std::fmt::Debug,
 {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, HgIndexError> {
         let file = File::open(path)?;
@@ -61,7 +64,7 @@ impl ChromosomeWriter {
 #[derive(Debug)]
 pub struct GenomicDataStore<T, M>
 where
-    T: SerdeType,
+    T: SerdeType + std::fmt::Debug,
     M: SerdeType,
 {
     index: BinningIndex<M>,
@@ -72,7 +75,7 @@ where
     _phantom: PhantomData<T>,
 }
 
-impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
+impl<T: SerdeType + std::fmt::Debug, M: SerdeType> GenomicDataStore<T, M> {
     const INDEX_FILENAME: &'static str = "index.bin";
 
     fn get_data_path(&self, chrom: &str) -> PathBuf {
@@ -81,6 +84,29 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
             path = path.join(key);
         }
         path.join(format!("{}.bin", chrom))
+    }
+
+    pub fn create_with_schema(
+        directory: &Path,
+        key: Option<String>,
+        schema: &BinningSchema,
+    ) -> std::io::Result<Self> {
+        // Create base directory
+        fs::create_dir_all(directory)?;
+
+        // Create key subdirectory if needed
+        if let Some(ref key) = key {
+            fs::create_dir_all(directory.join(key))?;
+        }
+
+        Ok(Self {
+            index: BinningIndex::from_schema(schema),
+            writers: HashMap::new(),
+            readers: HashMap::new(),
+            directory: directory.to_path_buf(),
+            key,
+            _phantom: PhantomData,
+        })
     }
 
     pub fn create(directory: &Path, key: Option<String>) -> std::io::Result<Self> {
@@ -152,16 +178,17 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
         end: u32,
         record: &T,
     ) -> Result<(), HgIndexError> {
+        // Check for zero-length features
+        if start >= end {
+            return Err(HgIndexError::ZeroLengthFeature(start, end));
+        }
+
         let store = self.get_or_create_writer(chrom)?;
-
-        // Add the record to the block-compressed writer for this
-        // chromosome.
+        // Add the record to the block-compressed writer for this chromosome.
         let virtual_offset = store.writer.add_record(&record)?;
-
         // Add the feature to the index now.
         self.index
             .add_feature(chrom, start, end, virtual_offset.into());
-
         Ok(())
     }
 
@@ -226,6 +253,7 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
         }
 
         let voffsets = self.index.find_overlapping(chrom, start, end);
+        // eprintln!("voffsets found = {}", voffsets.len());
 
         // Open chromosome file if not already open, returning empty results
         // if the chromosome is not found (assumed to mean no records for that
@@ -470,5 +498,49 @@ mod tests {
         // Verify that at least some threads got different numbers of results
         // due to querying different regions
         assert!(result_counts.iter().any(|&x| x != result_counts[0]));
+    }
+
+    #[test]
+    fn test_zero_length_features() {
+        let tmp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let store_path = tmp_dir.path();
+
+        let mut store = GenomicDataStore::<TestRecord, ()>::create(store_path, None)
+            .expect("Failed to create store");
+
+        // Create a test record to use
+        let record = TestRecord {
+            name: "test_feature".to_string(),
+            score: 42.0,
+            tags: vec!["test_tag".to_string(), "zero_length".to_string()],
+        };
+
+        // Test case 1: start equals end
+        let result = store.add_record("chr1", 100, 100, &record);
+        assert!(matches!(
+            result,
+            Err(HgIndexError::ZeroLengthFeature(100, 100))
+        ));
+
+        // Test case 2: start greater than end
+        let result = store.add_record("chr1", 200, 100, &record);
+        assert!(matches!(
+            result,
+            Err(HgIndexError::ZeroLengthFeature(200, 100))
+        ));
+
+        // Test case 3: valid record should work
+        let result = store.add_record("chr1", 100, 200, &record);
+        assert!(result.is_ok());
+
+        // Test case 4: minimum valid length (1)
+        let result = store.add_record("chr1", 300, 301, &record);
+        assert!(result.is_ok());
+
+        // Verify we can retrieve the valid records
+        if let Ok(records) = store.get_overlapping("chr1", 100, 200) {
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0], record);
+        }
     }
 }

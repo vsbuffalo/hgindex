@@ -3,9 +3,10 @@ use serde::{Deserialize, Serialize};
 pub mod block;
 pub mod error;
 pub mod index;
+pub mod io;
 pub mod store;
 
-pub use index::{BinningIndex, Feature, HierarchicalBins, SequenceIndex};
+pub use index::{BinningIndex, BinningSchema, Feature, HierarchicalBins, SequenceIndex};
 pub use store::GenomicDataStore;
 
 #[cfg(test)]

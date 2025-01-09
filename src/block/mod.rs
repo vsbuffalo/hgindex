@@ -179,6 +179,51 @@ mod tests {
     }
 
     #[test]
+    fn test_block_boundary_handling() -> Result<(), HgIndexError> {
+        let test_dir = TestDir::new("block_boundary").unwrap();
+        let path = test_dir.path().join("test.idx");
+
+        let file = File::create(&path)?;
+        let mut writer = BlockWriter::new(file)?;
+
+        // Create a sequence of records that will push us to a block boundary
+        let mut records = Vec::new();
+
+        // First, fill up most of a block, leaving just enough space that the next record's
+        // length prefix might get written but its data would spill over
+        let initial_size = BLOCK_SIZE - LENGTH_PREFIX_SIZE - 20;
+        records.push(create_test_record(1, initial_size));
+
+        // Now add several small records that should trigger the boundary condition
+        for i in 2..10 {
+            records.push(create_test_record(i as u32, 50)); // Small enough to fit in a block, but large enough to be meaningful
+        }
+
+        // Write all records and save their offsets
+        let offsets: Vec<_> = records
+            .iter()
+            .map(|rec| writer.add_record(rec))
+            .collect::<Result<_, _>>()?;
+        writer.finish()?;
+
+        // Read them back
+        let file = File::open(&path)?;
+        let mut reader = BlockReader::new(file)?;
+
+        // Verify each record
+        for (idx, (record, offset)) in records.iter().zip(offsets.iter()).enumerate() {
+            let read_record: TestRecord = reader.read_record(*offset)?;
+            assert_eq!(
+                record, &read_record,
+                "Record {} failed to match at offset {:?}",
+                idx, offset
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn test_length_prefix_spanning() -> Result<(), HgIndexError> {
         let test_dir = TestDir::new("length_prefix_span").unwrap();
         let path = test_dir.path().join("test.idx");

@@ -37,6 +37,10 @@ pub mod pack {
         /// Force overwrite of output file if it exists
         #[arg(short = 'f', long)]
         pub force: bool,
+
+        /// Hierarchical binning schema to use
+        #[arg(long, value_enum, default_value_t = hgindex::BinningSchema::Tabix)]
+        pub schema: hgindex::BinningSchema,
     }
 
     pub fn run(args: PackArgs) -> Result<(), HgIndexError> {
@@ -60,7 +64,11 @@ pub mod pack {
         );
 
         // Create store
-        let mut store = GenomicDataStore::<BedRecord, ()>::create(&output_path, None)?;
+        let mut store = GenomicDataStore::<BedRecord, ()>::create_with_schema(
+            &output_path,
+            None,
+            &args.schema,
+        )?;
 
         let mut csv_reader = build_tsv_reader(
             &args.input,
