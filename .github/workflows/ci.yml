@@ -23,6 +23,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y tabix
+          sudo apt-get install -y bgzip
 
       - name: Cache dependencies
         uses: actions/cache@v3

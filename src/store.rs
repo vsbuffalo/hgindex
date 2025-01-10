@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     fs::{self, File},
+    io,
     marker::PhantomData,
     path::{Path, PathBuf},
 };
@@ -13,20 +14,20 @@ use crate::{
     block::{BlockReader, BlockWriter, VirtualOffset},
     error::HgIndexError,
     index::{BinningIndex, BinningSchema},
-    SerdeType,
+    GenomicCoordinates, SerdeType,
 };
 
 #[derive(Debug)]
 pub struct ChromosomeReader<T>
 where
-    T: std::fmt::Debug,
+    T: GenomicCoordinates + std::fmt::Debug,
 {
     reader: BlockReader<T>,
 }
 
 impl<T> ChromosomeReader<T>
 where
-    T: for<'de> Deserialize<'de> + std::fmt::Debug,
+    T: GenomicCoordinates + for<'de> Deserialize<'de> + std::fmt::Debug,
 {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, HgIndexError> {
         let file = File::open(path)?;
@@ -35,9 +36,9 @@ where
         })
     }
 
-    pub fn read_at(&mut self, voffset: VirtualOffset) -> Result<T, HgIndexError> {
-        self.reader.read_record(voffset)
-    }
+    //pub fn read_at(&mut self, voffset: VirtualOffset) -> Result<T, HgIndexError> {
+    //    self.reader.read_record(voffset)
+    //}
 }
 
 #[derive(Debug)]
@@ -53,30 +54,111 @@ impl ChromosomeWriter {
         })
     }
 
-    pub fn write_record<T: Serialize>(
+    pub fn add_record<T: Serialize + std::fmt::Debug>(
         &mut self,
         record: &T,
     ) -> Result<VirtualOffset, HgIndexError> {
-        self.writer.add_record(record)
+        self.writer.add_record(&record)
     }
 }
 
-#[derive(Debug)]
 pub struct GenomicDataStore<T, M>
 where
-    T: SerdeType + std::fmt::Debug,
-    M: SerdeType,
+    T: GenomicCoordinates + SerdeType + std::fmt::Debug,
+    M: SerdeType + std::fmt::Debug,
 {
-    index: BinningIndex<M>,
+    directory: PathBuf,
+    index: Option<BinningIndex<M>>,
     writers: HashMap<String, ChromosomeWriter>,
     readers: HashMap<String, ChromosomeReader<T>>,
-    directory: PathBuf,
+    schema: BinningSchema,
     key: Option<String>,
+    // For sort validation
+    last_chrom: Option<String>,
+    last_pos: Option<u32>,
+    // Store coordinates and offsets during writing
+    coordinates: HashMap<String, Vec<(u32, u32, VirtualOffset)>>,
     _phantom: PhantomData<T>,
 }
 
-impl<T: SerdeType + std::fmt::Debug, M: SerdeType> GenomicDataStore<T, M> {
-    const INDEX_FILENAME: &'static str = "index.bin";
+impl<T, M> GenomicDataStore<T, M>
+where
+    T: GenomicCoordinates + SerdeType + std::fmt::Debug,
+    M: SerdeType + std::fmt::Debug,
+{
+    pub fn create(directory: &Path, key: Option<String>) -> io::Result<Self> {
+        Self::create_with_schema(directory, key, &BinningSchema::default())
+    }
+
+    pub fn open(directory: &Path, key: Option<String>) -> Result<Self, HgIndexError> {
+        // Load existing index
+        let index_path = if let Some(ref key) = key {
+            directory.join(key).join("index.bin")
+        } else {
+            directory.join("index.bin")
+        };
+
+        let index = BinningIndex::open(&index_path)?;
+        let schema = index.schema.clone();
+
+        Ok(Self {
+            directory: directory.to_path_buf(),
+            index: Some(index),
+            writers: HashMap::new(),
+            readers: HashMap::new(),
+            schema,
+            key,
+            last_chrom: None,
+            last_pos: None,
+            coordinates: HashMap::new(),
+            _phantom: PhantomData,
+        })
+    }
+
+    // Metadata methods
+    pub fn metadata(&self) -> Option<&M> {
+        self.index.as_ref().and_then(|idx| idx.metadata.as_ref())
+    }
+
+    pub fn metadata_mut(&mut self) -> Option<&mut M> {
+        self.index.as_mut().and_then(|idx| idx.metadata.as_mut())
+    }
+
+    pub fn set_metadata(&mut self, metadata: M) {
+        if let Some(idx) = self.index.as_mut() {
+            idx.metadata = Some(metadata);
+        } else {
+            panic!("Cannot set index-level metadata before index has been generated.");
+        }
+    }
+
+    pub fn take_metadata(&mut self) -> Option<M> {
+        self.index.as_mut().and_then(|idx| idx.metadata.take())
+    }
+
+    pub fn create_with_schema(
+        directory: &Path,
+        key: Option<String>,
+        schema: &BinningSchema,
+    ) -> io::Result<Self> {
+        fs::create_dir_all(directory)?;
+        if let Some(ref key) = key {
+            fs::create_dir_all(directory.join(key))?;
+        }
+
+        Ok(Self {
+            directory: directory.to_path_buf(),
+            index: None,
+            writers: HashMap::new(),
+            readers: HashMap::new(),
+            schema: schema.clone(),
+            key,
+            last_chrom: None,
+            last_pos: None,
+            coordinates: HashMap::new(),
+            _phantom: PhantomData,
+        })
+    }
 
     fn get_data_path(&self, chrom: &str) -> PathBuf {
         let mut path = self.directory.clone();
@@ -86,57 +168,97 @@ impl<T: SerdeType + std::fmt::Debug, M: SerdeType> GenomicDataStore<T, M> {
         path.join(format!("{}.bin", chrom))
     }
 
-    pub fn create_with_schema(
-        directory: &Path,
-        key: Option<String>,
-        schema: &BinningSchema,
-    ) -> std::io::Result<Self> {
-        // Create base directory
-        fs::create_dir_all(directory)?;
-
-        // Create key subdirectory if needed
-        if let Some(ref key) = key {
-            fs::create_dir_all(directory.join(key))?;
-        }
-
-        Ok(Self {
-            index: BinningIndex::from_schema(schema),
-            writers: HashMap::new(),
-            readers: HashMap::new(),
-            directory: directory.to_path_buf(),
-            key,
-            _phantom: PhantomData,
-        })
-    }
-
-    pub fn create(directory: &Path, key: Option<String>) -> std::io::Result<Self> {
-        // Create base directory
-        fs::create_dir_all(directory)?;
-
-        // Create key subdirectory if needed
-        if let Some(ref key) = key {
-            fs::create_dir_all(directory.join(key))?;
-        }
-
-        Ok(Self {
-            index: BinningIndex::new(),
-            writers: HashMap::new(),
-            readers: HashMap::new(),
-            directory: directory.to_path_buf(),
-            key,
-            _phantom: PhantomData,
-        })
-    }
-
     fn get_or_create_writer(&mut self, chrom: &str) -> Result<&mut ChromosomeWriter, HgIndexError> {
         if !self.writers.contains_key(chrom) {
             let path = self.get_data_path(chrom);
-            // Need to create parent directories here!
-            std::fs::create_dir_all(path.parent().unwrap())?; // <-- Add this
-            let writer = ChromosomeWriter::new(path.to_str().unwrap())?;
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            let writer = ChromosomeWriter::new(path)?;
             self.writers.insert(chrom.to_string(), writer);
         }
         Ok(self.writers.get_mut(chrom).unwrap())
+    }
+
+    pub fn add_record(&mut self, chrom: &str, record: &T) -> Result<(), HgIndexError> {
+        let start = record.start();
+        let end = record.end();
+
+        // Validate coordinates
+        if end <= start {
+            return Err(HgIndexError::ZeroLengthFeature(start, end));
+        }
+
+        // Validate sorting
+        if let (Some(last_chrom), Some(last_pos)) = (self.last_chrom.as_ref(), self.last_pos) {
+            match last_chrom.as_str().cmp(chrom) {
+                std::cmp::Ordering::Greater => {
+                    return Err(HgIndexError::from("Records must be sorted by chromosome"));
+                }
+                std::cmp::Ordering::Equal if start < last_pos => {
+                    return Err(HgIndexError::from(
+                        "Records must be sorted by position within chromosome",
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        // Update last position
+        self.last_chrom = Some(chrom.to_string());
+        self.last_pos = Some(start);
+
+        // Write record and get its offset
+        let writer = self.get_or_create_writer(chrom)?;
+        let offset = writer.add_record(record)?;
+
+        // Store coordinates and offset for indexing phase
+        self.coordinates
+            .entry(chrom.to_string())
+            .or_default()
+            .push((start, end, offset));
+
+        Ok(())
+    }
+
+    fn index(&mut self) -> Result<(), HgIndexError> {
+        let mut index = BinningIndex::from_schema(&self.schema);
+
+        // Process each chromosome's coordinates
+        for (chrom, coords) in &self.coordinates {
+            for (start, end, offset) in coords {
+                index.add_feature(chrom, *start, *end, (*offset).into());
+            }
+        }
+
+        self.index = Some(index);
+        Ok(())
+    }
+
+    pub fn finalize(&mut self) -> Result<(), HgIndexError> {
+        // First flush all writers
+        for writer in self.writers.values_mut() {
+            writer.writer.flush_block()?;
+        }
+
+        // Clear writers
+        self.writers.clear();
+
+        // Build and save the index
+        // let start = Instant::now();
+        self.index()?;
+        // let duration = start.elapsed();
+        // eprintln!("  Building index took {:?}", duration);
+
+        // Write index to disk
+        if let Some(index) = &mut self.index {
+            let index_path = if let Some(ref key) = self.key {
+                self.directory.join(key).join("index.bin")
+            } else {
+                self.directory.join("index.bin")
+            };
+            index.write(&index_path)?;
+        }
+
+        Ok(())
     }
 
     fn get_or_create_reader(
@@ -145,93 +267,12 @@ impl<T: SerdeType + std::fmt::Debug, M: SerdeType> GenomicDataStore<T, M> {
     ) -> Result<&mut ChromosomeReader<T>, HgIndexError> {
         if !self.readers.contains_key(chrom) {
             let path = self.get_data_path(chrom);
-            let reader = ChromosomeReader::new(path.to_str().unwrap())?;
+            let reader = ChromosomeReader::new(path)?;
             self.readers.insert(chrom.to_string(), reader);
         }
         Ok(self.readers.get_mut(chrom).unwrap())
     }
 
-    // Add these methods to your existing impl block
-    pub fn metadata(&self) -> Option<&M> {
-        self.index.metadata.as_ref()
-    }
-
-    /// Get a mutable reference to the store's metadata
-    pub fn metadata_mut(&mut self) -> Option<&mut M> {
-        self.index.metadata.as_mut()
-    }
-
-    /// Set the store's metadata
-    pub fn set_metadata(&mut self, metadata: M) {
-        self.index.metadata = Some(metadata);
-    }
-
-    /// Take ownership of the metadata, leaving None in its place
-    pub fn take_metadata(&mut self) -> Option<M> {
-        self.index.metadata.take()
-    }
-
-    pub fn add_record(
-        &mut self,
-        chrom: &str,
-        start: u32,
-        end: u32,
-        record: &T,
-    ) -> Result<(), HgIndexError> {
-        // Check for zero-length features
-        if start >= end {
-            return Err(HgIndexError::ZeroLengthFeature(start, end));
-        }
-
-        let store = self.get_or_create_writer(chrom)?;
-        // Add the record to the block-compressed writer for this chromosome.
-        let virtual_offset = store.writer.add_record(&record)?;
-        // Add the feature to the index now.
-        self.index
-            .add_feature(chrom, start, end, virtual_offset.into());
-        Ok(())
-    }
-
-    pub fn finalize(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        // Finish each writer explicitly before clearing
-        for (_, writer) in self.writers.drain() {
-            writer.writer.finish()?;
-        }
-
-        let index_path = if let Some(ref key) = self.key {
-            self.directory.join(key).join(Self::INDEX_FILENAME)
-        } else {
-            self.directory.join(Self::INDEX_FILENAME)
-        };
-
-        self.index.write(index_path.as_path())?;
-        Ok(())
-    }
-
-    pub fn open(
-        directory: &Path,
-        key: Option<String>,
-    ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        // Keep original path
-        let index_path = if let Some(ref key) = key {
-            directory.join(key).join(Self::INDEX_FILENAME)
-        } else {
-            directory.join(Self::INDEX_FILENAME)
-        };
-
-        let index = BinningIndex::open(&index_path)?;
-
-        Ok(Self {
-            index,
-            directory: directory.to_path_buf(), // Use original directory
-            writers: HashMap::new(),
-            readers: HashMap::new(),
-            key,
-            _phantom: PhantomData,
-        })
-    }
-
-    /// The features overlapping the range with this start and end position.
     pub fn get_overlapping(
         &mut self,
         chrom: &str,
@@ -241,33 +282,26 @@ impl<T: SerdeType + std::fmt::Debug, M: SerdeType> GenomicDataStore<T, M> {
         if end <= start {
             return Err(HgIndexError::InvalidInterval { start, end });
         }
-        // Early return empty vec if chromosome not in index
-        if !self.index.sequences.contains_key(chrom) {
+
+        let index = self
+            .index
+            .as_ref()
+            .ok_or_else(|| HgIndexError::from("Index not built yet"))?;
+
+        // Get the range of offsets that might contain overlapping features
+        let Some((min_offset, max_offset)) = index.get_candidate_offsets(chrom, start, end) else {
             return Ok(Vec::new());
-        }
-        let mut results = Vec::new();
-
-        // Early return if chromosome not in index
-        if !self.index.sequences.contains_key(chrom) {
-            return Ok(results);
-        }
-
-        let voffsets = self.index.find_overlapping(chrom, start, end);
-        // eprintln!("voffsets found = {}", voffsets.len());
-
-        // Open chromosome file if not already open, returning empty results
-        // if the chromosome is not found (assumed to mean no records for that
-        // chromosome).
-        match self.get_or_create_reader(chrom) {
-            Ok(reader) => {
-                for voffset in voffsets {
-                    results.push(reader.read_at(voffset.into())?);
-                }
-            }
-            Err(_) => return Ok(results),
         };
 
-        Ok(results)
+        let reader = self.get_or_create_reader(chrom)?;
+
+        // Convert to VirtualOffset and read records
+        reader.reader.read_records_between(
+            VirtualOffset::from(min_offset),
+            VirtualOffset::from(max_offset),
+            start,
+            end,
+        )
     }
 }
 
@@ -283,18 +317,30 @@ mod tests {
     // A simple test record type
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     struct TestRecord {
+        start: u32,
+        end: u32,
         name: String,
         score: f64,
         tags: Vec<String>,
     }
 
-    fn make_test_records() -> Vec<(String, u32, u32, TestRecord)> {
+    impl GenomicCoordinates for TestRecord {
+        fn start(&self) -> u32 {
+            self.start
+        }
+
+        fn end(&self) -> u32 {
+            self.end
+        }
+    }
+
+    fn make_test_records() -> Vec<(String, TestRecord)> {
         vec![
             (
                 "chr1".to_string(),
-                1000,
-                2000,
                 TestRecord {
+                    start: 1000,
+                    end: 2000,
                     name: "feature1".to_string(),
                     score: 0.5,
                     tags: vec!["exon".to_string(), "coding".to_string()],
@@ -302,9 +348,9 @@ mod tests {
             ),
             (
                 "chr1".to_string(),
-                1500,
-                2500,
                 TestRecord {
+                    start: 1500,
+                    end: 2500,
                     name: "feature2".to_string(),
                     score: 0.8,
                     tags: vec!["promoter".to_string()],
@@ -312,9 +358,9 @@ mod tests {
             ),
             (
                 "chr2".to_string(),
-                50000,
-                60000,
                 TestRecord {
+                    start: 50000,
+                    end: 60000,
                     name: "feature3".to_string(),
                     score: 0.3,
                     tags: vec!["intron".to_string()],
@@ -334,9 +380,9 @@ mod tests {
         // Create store and add records
         let mut store = GenomicDataStore::<TestRecord, ()>::create(base_dir, Some(key.clone()))
             .expect("Failed to create store");
-        for (chrom, start, end, record) in make_test_records() {
+        for (chrom, record) in make_test_records() {
             store
-                .add_record(&chrom, start, end, &record)
+                .add_record(&chrom, &record)
                 .expect("Failed to add record");
         }
 
@@ -402,6 +448,8 @@ mod tests {
         let mut store = GenomicDataStore::<TestRecord, String>::create(&store_path, None)
             .expect("Failed to create store");
 
+        // Index must be created before metadata.
+        store.index().unwrap();
         store.set_metadata("initial metadata".to_string());
 
         // Test metadata access
@@ -436,7 +484,19 @@ mod tests {
     // A minimal test record
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     struct MinimalTestRecord {
+        start: u32,
+        end: u32,
         score: f64,
+    }
+
+    impl GenomicCoordinates for MinimalTestRecord {
+        fn start(&self) -> u32 {
+            self.start
+        }
+
+        fn end(&self) -> u32 {
+            self.end
+        }
     }
 
     #[test]
@@ -454,12 +514,16 @@ mod tests {
 
             // Add some overlapping records
             for i in 0..10 {
+                let start = i * 1000;
+                let end = (i + 2) * 1000; // Overlapping regions
                 store
                     .add_record(
                         "chr1",
-                        i * 1000,
-                        (i + 2) * 1000, // Overlapping regions
-                        &MinimalTestRecord { score: i as f64 },
+                        &MinimalTestRecord {
+                            start,
+                            end,
+                            score: i as f64,
+                        },
                     )
                     .expect("Failed to add record");
             }
@@ -509,38 +573,42 @@ mod tests {
             .expect("Failed to create store");
 
         // Create a test record to use
-        let record = TestRecord {
-            name: "test_feature".to_string(),
-            score: 42.0,
-            tags: vec!["test_tag".to_string(), "zero_length".to_string()],
-        };
+        fn make_test_record(start: u32, end: u32) -> TestRecord {
+            TestRecord {
+                start,
+                end,
+                name: "test_feature".to_string(),
+                score: 42.0,
+                tags: vec!["test_tag".to_string(), "zero_length".to_string()],
+            }
+        }
 
         // Test case 1: start equals end
-        let result = store.add_record("chr1", 100, 100, &record);
+        let result = store.add_record("chr1", &make_test_record(100, 100));
         assert!(matches!(
             result,
             Err(HgIndexError::ZeroLengthFeature(100, 100))
         ));
 
         // Test case 2: start greater than end
-        let result = store.add_record("chr1", 200, 100, &record);
+        let result = store.add_record("chr1", &make_test_record(200, 100));
         assert!(matches!(
             result,
             Err(HgIndexError::ZeroLengthFeature(200, 100))
         ));
 
         // Test case 3: valid record should work
-        let result = store.add_record("chr1", 100, 200, &record);
+        let result = store.add_record("chr1", &make_test_record(300, 310));
         assert!(result.is_ok());
 
         // Test case 4: minimum valid length (1)
-        let result = store.add_record("chr1", 300, 301, &record);
+        let result = store.add_record("chr1", &make_test_record(300, 301));
         assert!(result.is_ok());
 
         // Verify we can retrieve the valid records
         if let Ok(records) = store.get_overlapping("chr1", 100, 200) {
             assert_eq!(records.len(), 1);
-            assert_eq!(records[0], record);
+            assert_eq!(records[0], make_test_record(100, 107));
         }
     }
 }

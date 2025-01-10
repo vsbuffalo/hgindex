@@ -129,7 +129,7 @@ pub mod pack {
             };
 
             // Add to store
-            store.add_record(&chrom, adj_start, adj_end, &bed_record)?;
+            store.add_record(&chrom, &bed_record)?;
             pb.inc(1);
         }
 

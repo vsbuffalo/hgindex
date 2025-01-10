@@ -5,8 +5,8 @@ mod commands;
 mod cli {
     #[cfg(all(feature = "dev"))]
     use super::commands::random_bed::random_bed;
-    #[cfg(all(feature = "dev"))]
-    use crate::commands::analyze;
+    //#[cfg(all(feature = "dev"))]
+    //use crate::commands::analyze;
     use crate::commands::pack::pack;
     use crate::commands::query::query;
     use clap::Parser;
@@ -21,9 +21,9 @@ mod cli {
 
     #[derive(clap::Subcommand)]
     enum Commands {
-        #[cfg(feature = "dev")]
-        /// Analyze index structure and performance metrics
-        Analyze(analyze::AnalyzeArgs),
+        //#[cfg(feature = "dev")]
+        ///// Analyze index structure and performance metrics
+        //Analyze(analyze::AnalyzeArgs),
         /// Block-compress and index a file.
         Pack(pack::PackArgs),
         Query(query::QueryArgs),
@@ -35,8 +35,8 @@ mod cli {
     pub fn run() -> Result<(), HgIndexError> {
         let cli = Cli::parse();
         match cli.command {
-            #[cfg(feature = "dev")]
-            Commands::Analyze(args) => analyze::run(args),
+            //#[cfg(feature = "dev")]
+            //Commands::Analyze(args) => analyze::run(args),
             Commands::Pack(args) => pack::run(args),
             Commands::Query(args) => query::run(args),
             #[cfg(feature = "dev")]

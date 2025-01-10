@@ -215,12 +215,6 @@ impl HierarchicalBins {
                 bins.push(offset + bin);
             }
 
-            // Early exit if we've reached a level where start and end are in the same bin
-            // TODO: BUG
-            //if start_bin == end_bin {
-            //    break;
-            //}
-
             // Shift to next level (right shift by the level_shift)
             start_bin >>= self.level_shift;
             end_bin >>= self.level_shift;

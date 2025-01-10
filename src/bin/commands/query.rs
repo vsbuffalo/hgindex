@@ -6,7 +6,7 @@ pub mod query {
     use clap::Args;
     use flate2::Compression;
     use hgindex::error::HgIndexError;
-    use hgindex::io::io::OutputStream;
+    use hgindex::io::OutputStream;
     use hgindex::store::GenomicDataStore;
     use std::fs;
     use std::path::PathBuf;

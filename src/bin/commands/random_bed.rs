@@ -5,7 +5,7 @@ pub mod random_bed {
     use crate::commands::BedRecord;
     use clap::Args;
     use hgindex::error::HgIndexError;
-    use hgindex::io::io::OutputStream;
+    use hgindex::io::OutputStream;
     use rand::{seq::SliceRandom, Rng, SeedableRng};
     use std::io::Write;
     use std::path::PathBuf;
