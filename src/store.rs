@@ -124,7 +124,7 @@ where
         self.index.as_mut().and_then(|idx| idx.metadata.as_mut())
     }
 
-    pub fn set_metadata(&mut self, metadata: M) {
+    fn set_metadata(&mut self, metadata: M) {
         if let Some(idx) = self.index.as_mut() {
             idx.metadata = Some(metadata);
         } else {
@@ -247,6 +247,37 @@ where
         self.index()?;
         // let duration = start.elapsed();
         // eprintln!("  Building index took {:?}", duration);
+
+        // Write index to disk
+        if let Some(index) = &mut self.index {
+            let index_path = if let Some(ref key) = self.key {
+                self.directory.join(key).join("index.bin")
+            } else {
+                self.directory.join("index.bin")
+            };
+            index.write(&index_path)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn finalize_with_metadata(&mut self, metadata: M) -> Result<(), HgIndexError> {
+        // First flush all writers
+        for writer in self.writers.values_mut() {
+            writer.writer.flush_block()?;
+        }
+
+        // Clear writers
+        self.writers.clear();
+
+        // Build and save the index
+        // let start = Instant::now();
+        self.index()?;
+        // let duration = start.elapsed();
+        // eprintln!("  Building index took {:?}", duration);
+
+        // Now we can set metadata.
+        self.set_metadata(metadata);
 
         // Write index to disk
         if let Some(index) = &mut self.index {

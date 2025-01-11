@@ -22,6 +22,9 @@ pub enum HgIndexError {
     #[error("Serialization error: {0}")]
     SerializationError(String),
 
+    #[error("Decompression error: {0}")]
+    DecompressionError(String),
+
     #[error("Deserialization error: {0}")]
     DeserializationError(String),
 

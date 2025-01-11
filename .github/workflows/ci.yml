@@ -1,14 +1,11 @@
 name: CI
-
 on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-
 env:
   CARGO_TERM_COLOR: always
-
 jobs:
   test:
     name: Test
@@ -19,23 +16,32 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install tabix and bgzip
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tabix
-          sudo apt-get install -y bgzip
+        # presently does not work
+        #- name: Install tabix
+        #  run: |
+        #    sudo apt-get update
+        #    sudo apt-get install -y tabix
+        #    which bgzip
+        #    bgzip --version
+        #    which tabix
+        #    tabix --version
 
-      - name: Cache dependencies
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        #- name: Create test directories
+        #  run: |
+        #    mkdir -p target/test_files
+        #    chmod 777 target/test_files
+
+        #- name: Cache dependencies
+        #  uses: actions/cache@v3
+        #  with:
+        #    path: |
+        #      ~/.cargo/registry
+        #      ~/.cargo/git
+        #      target
+        #    key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run tests
-        run: cargo test
+        run: RUST_BACKTRACE=1 cargo test --verbose --lib # integration test uses bgzip, which has install isues
 
       - name: Check formatting
         run: cargo fmt -- --check

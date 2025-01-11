@@ -8,7 +8,7 @@ pub use writer::BlockWriter;
 
 pub const BLOCK_SIZE: usize = 65536; // 2^16 bytes like BGZF
 pub const COMPRESSION_LEVEL: i32 = 3;
-pub const BATCH_SIZE: usize = 32;
+pub const BATCH_SIZE: usize = 512; // seems to work well in experiments.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VirtualOffset {

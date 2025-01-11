@@ -1,7 +1,5 @@
 // bin/commands/mod.rs
 
-// #[cfg(all(feature = "cli", feature = "dev"))]
-// pub mod analyze;
 #[cfg(feature = "cli")]
 pub mod pack;
 #[cfg(feature = "cli")]
