@@ -20,11 +20,9 @@ jobs:
       - name: Install tabix
         run: |
           sudo apt-get update
-          sudo apt-get install -y htslib-bin
-          echo "Installed packages:"
-          dpkg -l | grep hts
-          echo "Contents of htslib-bin:"
-          dpkg -L htslib-bin
+          sudo apt-get install -y tabix
+          echo "Contents of tabix:"
+          dpkg -L tabix
 
       - name: Verify tools
         run: |
