@@ -71,7 +71,7 @@ installing to enable), primarily for integration/validation tests and
 benchmarks against tabix's results.
 
 ```
-$ hgindex pack tests/data/repeat_masker.bed        # serialie the BED records and index
+$ hgidx pack tests/data/repeat_masker.bed        # serialie the BED records and index
 $ hgidx  query --regions tests/data/refgene.bed    # query a set of ranges
 $ hgidx  query chr2:4131233-4131233                # query a single range
 ```

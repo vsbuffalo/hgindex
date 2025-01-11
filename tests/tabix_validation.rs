@@ -2,8 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const BEDSIZE: u32 = 50_000_000;
-// const BEDSIZE: u32 = 1_000_000;
+// const BEDSIZE: u32 = 50_000_000;
+const BEDSIZE: u32 = 1_000_000;
 
 fn check_tool_exists(tool: &str) -> Result<(), Box<dyn std::error::Error>> {
     match Command::new(tool).arg("--version").output() {
