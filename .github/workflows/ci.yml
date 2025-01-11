@@ -16,6 +16,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Install tabix
+      - name: Install tabix
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y htslib-bin
+          echo "Installed packages:"
+          dpkg -l | grep hts
+          echo "Contents of htslib-bin:"
+          dpkg -L htslib-bin
+
+      - name: Verify tools
+        run: |
+          set -e  # Make script exit on first error
+          which bgzip || { echo "bgzip not found"; exit 1; }
+          which tabix || { echo "tabix not found"; exit 1; }
+          bgzip --version
+          tabix --version
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
