@@ -82,16 +82,20 @@ fn test_tabix_compatibility() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run BGZip compression
     println!("Running BGZip compression...");
-    let bgzip_output = Command::new("bgzip").arg("-c").arg(&test_bed).output()?;
+    let bgzip_output = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "bgzip -c {} > {}",
+            test_bed.display(),
+            bgzipped.display()
+        ))
+        .output()?;
 
     if !bgzip_output.status.success() {
         let stderr = String::from_utf8_lossy(&bgzip_output.stderr);
         println!("BGZip error: {}", stderr);
         return Err("BGZip compression failed".into());
     }
-
-    // Write compressed data to file
-    fs::write(&bgzipped, bgzip_output.stdout)?;
 
     // Verify BGZip file
     let bgzip_size = fs::metadata(&bgzipped)?.len();
