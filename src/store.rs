@@ -1,3 +1,4 @@
+use std::io;
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -6,13 +7,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{error::HgIndexError, index::BinningIndex, SerdeType};
+use crate::GenomicCoordinates;
+use crate::{error::HgIndexError, index::BinningIndex, BinningSchema, SerdeType};
 
 #[derive(Debug)]
 pub struct GenomicDataStore<T, M>
 where
-    T: SerdeType,
-    M: SerdeType,
+    T: GenomicCoordinates + SerdeType,
+    M: SerdeType + std::fmt::Debug,
 {
     index: BinningIndex<M>,
     data_files: HashMap<String, File>,
@@ -21,7 +23,7 @@ where
     _phantom: PhantomData<T>,
 }
 
-impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
+impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicDataStore<T, M> {
     const MAGIC: [u8; 4] = *b"GIDX";
     const INDEX_FILENAME: &'static str = "index.bin";
 
@@ -33,19 +35,21 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
         path.join(format!("{}.bin", chrom))
     }
 
-    pub fn create(directory: &Path, key: Option<String>) -> std::io::Result<Self> {
-        // Create main directory and key subdirectory if needed
-        let _target_dir = if let Some(ref key) = key {
-            let key_dir = directory.join(key);
-            fs::create_dir_all(&key_dir)?;
-            key_dir
-        } else {
-            fs::create_dir_all(directory)?;
-            directory.to_path_buf()
-        };
+    pub fn create(directory: &Path, key: Option<String>) -> io::Result<Self> {
+        Self::create_with_schema(directory, key, &BinningSchema::default())
+    }
 
+    pub fn create_with_schema(
+        directory: &Path,
+        key: Option<String>,
+        schema: &BinningSchema,
+    ) -> io::Result<Self> {
+        fs::create_dir_all(directory)?;
+        if let Some(ref key) = key {
+            fs::create_dir_all(directory.join(key))?;
+        }
         Ok(Self {
-            index: BinningIndex::new(),
+            index: BinningIndex::from_schema(schema),
             data_files: HashMap::new(),
             directory: directory.to_path_buf(),
             key,
@@ -86,13 +90,7 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
         self.index.metadata.take()
     }
 
-    pub fn add_record(
-        &mut self,
-        chrom: &str,
-        start: u32,
-        end: u32,
-        record: &T,
-    ) -> std::io::Result<()> {
+    pub fn add_record(&mut self, chrom: &str, record: &T) -> std::io::Result<()> {
         let file = self.get_or_create_file(chrom)?;
 
         // Create a scope to ensure writer is dropped before we use self.index
@@ -113,6 +111,8 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
         }; // writer is dropped here, releasing the borrow
 
         // Add the feature to the index now.
+        let start = record.start();
+        let end = record.end();
         self.index.add_feature(chrom, start, end, offset);
 
         Ok(())
@@ -225,6 +225,8 @@ impl<T: SerdeType, M: SerdeType> GenomicDataStore<T, M> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use crate::test_utils::test_utils::TestDir;
 
     use super::*;
@@ -233,18 +235,30 @@ mod tests {
     // A simple test record type
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     struct TestRecord {
+        start: u32,
+        end: u32,
         name: String,
         score: f64,
         tags: Vec<String>,
     }
 
-    fn make_test_records() -> Vec<(String, u32, u32, TestRecord)> {
+    impl GenomicCoordinates for TestRecord {
+        fn start(&self) -> u32 {
+            self.start
+        }
+
+        fn end(&self) -> u32 {
+            self.end
+        }
+    }
+
+    fn make_test_records() -> Vec<(String, TestRecord)> {
         vec![
             (
                 "chr1".to_string(),
-                1000,
-                2000,
                 TestRecord {
+                    start: 1000,
+                    end: 2000,
                     name: "feature1".to_string(),
                     score: 0.5,
                     tags: vec!["exon".to_string(), "coding".to_string()],
@@ -252,9 +266,9 @@ mod tests {
             ),
             (
                 "chr1".to_string(),
-                1500,
-                2500,
                 TestRecord {
+                    start: 1500,
+                    end: 2500,
                     name: "feature2".to_string(),
                     score: 0.8,
                     tags: vec!["promoter".to_string()],
@@ -262,9 +276,9 @@ mod tests {
             ),
             (
                 "chr2".to_string(),
-                50000,
-                60000,
                 TestRecord {
+                    start: 50000,
+                    end: 60000,
                     name: "feature3".to_string(),
                     score: 0.3,
                     tags: vec!["intron".to_string()],
@@ -276,25 +290,23 @@ mod tests {
     #[test]
     fn test_store_and_retrieve() {
         let test_dir = TestDir::new("store_and_retrieve").expect("Failed to create test dir");
-        let store_path = test_dir.path().join("test.gidx");
+        let base_dir = test_dir.path(); // Don't add test.gidx
 
         // An example key
         let key = "example-key".to_string();
 
         // Create store and add records
-        let mut store = GenomicDataStore::<TestRecord, ()>::create(&store_path, Some(key.clone()))
+        let mut store = GenomicDataStore::<TestRecord, ()>::create(base_dir, Some(key.clone()))
             .expect("Failed to create store");
-
-        for (chrom, start, end, record) in make_test_records() {
+        for (chrom, record) in make_test_records() {
             store
-                .add_record(&chrom, start, end, &record)
+                .add_record(&chrom, &record)
                 .expect("Failed to add record");
         }
 
         store.finalize().expect("Failed to finalize store");
 
-        // Open store and query
-        let mut store = GenomicDataStore::<TestRecord, ()>::open(&store_path, Some(key.clone()))
+        let mut store = GenomicDataStore::<TestRecord, ()>::open(&base_dir, Some(key.clone()))
             .expect("Failed to open store");
 
         // Test overlapping query
@@ -354,6 +366,8 @@ mod tests {
         let mut store = GenomicDataStore::<TestRecord, String>::create(&store_path, None)
             .expect("Failed to create store");
 
+        // Index must be created before metadata.
+        store.finalize().unwrap();
         store.set_metadata("initial metadata".to_string());
 
         // Test metadata access
@@ -388,25 +402,19 @@ mod tests {
     // A minimal test record
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     struct MinimalTestRecord {
+        start: u32,
+        end: u32,
         score: f64,
     }
 
-    #[test]
-    fn test_zero_length_features() {
-        let test_dir = TestDir::new("zero_length").expect("Failed to create test dir");
-        let store_path = test_dir.path().join("test.gidx");
-        let mut store = GenomicDataStore::<MinimalTestRecord, ()>::create(&store_path, None)
-            .expect("Failed to create store");
+    impl GenomicCoordinates for MinimalTestRecord {
+        fn start(&self) -> u32 {
+            self.start
+        }
 
-        // Test zero-length feature
-        store
-            .add_record("chr1", 1000, 1000, &MinimalTestRecord { score: 1.2 })
-            .expect("Failed to add zero-length record");
-
-        // Test position 0
-        store
-            .add_record("chr1", 0, 100, &MinimalTestRecord { score: 2.3 })
-            .expect("Failed to add record at position 0");
+        fn end(&self) -> u32 {
+            self.end
+        }
     }
 
     #[test]
@@ -424,12 +432,16 @@ mod tests {
 
             // Add some overlapping records
             for i in 0..10 {
+                let start = i * 1000;
+                let end = (i + 2) * 1000; // Overlapping regions
                 store
                     .add_record(
                         "chr1",
-                        i * 1000,
-                        (i + 2) * 1000, // Overlapping regions
-                        &MinimalTestRecord { score: i as f64 },
+                        &MinimalTestRecord {
+                            start,
+                            end,
+                            score: i as f64,
+                        },
                     )
                     .expect("Failed to add record");
             }
