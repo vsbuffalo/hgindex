@@ -2,13 +2,21 @@ use std::io;
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io::{BufWriter, Read, Seek, SeekFrom, Write},
+    io::{BufWriter, Seek, Write},
     marker::PhantomData,
     path::{Path, PathBuf},
 };
 
+use memmap2::Mmap;
+
 use crate::GenomicCoordinates;
 use crate::{error::HgIndexError, index::BinningIndex, BinningSchema, SerdeType};
+
+#[derive(Debug)]
+enum FileHandle {
+    Write(File),
+    Read(Mmap),
+}
 
 #[derive(Debug)]
 pub struct GenomicDataStore<T, M>
@@ -17,7 +25,7 @@ where
     M: SerdeType + std::fmt::Debug,
 {
     index: BinningIndex<M>,
-    data_files: HashMap<String, File>,
+    data_files: HashMap<String, FileHandle>,
     directory: PathBuf,
     key: Option<String>,
     _phantom: PhantomData<T>,
@@ -61,13 +69,21 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
         if !self.data_files.contains_key(chrom) {
             let data_path = self.get_data_path(chrom);
             let file = File::create(&data_path)?;
-            let mut writer = BufWriter::new(&file);
+            let mut writer = BufWriter::new(file);
             writer.write_all(&Self::MAGIC)?;
             writer.flush()?;
-            let _data_file = writer.into_inner()?;
-            self.data_files.insert(chrom.to_string(), file);
+            let file = writer.into_inner()?;
+            self.data_files
+                .insert(chrom.to_string(), FileHandle::Write(file));
         }
-        Ok(self.data_files.get_mut(chrom).unwrap())
+
+        match self.data_files.get_mut(chrom).unwrap() {
+            FileHandle::Write(file) => Ok(file),
+            FileHandle::Read(_) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "File is open for reading",
+            )),
+        }
     }
 
     // Add these methods to your existing impl block
@@ -91,6 +107,13 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
     }
 
     pub fn add_record(&mut self, chrom: &str, record: &T) -> std::io::Result<()> {
+        // If this is a new chromosome and we already have some files open,
+        // close the previous chromosome's file
+        if !self.data_files.contains_key(chrom) {
+            // Keep only this chromosome's file open
+            self.data_files.retain(|k, _| k == chrom);
+        }
+
         let file = self.get_or_create_file(chrom)?;
 
         // Create a scope to ensure writer is dropped before we use self.index
@@ -118,7 +141,15 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
         Ok(())
     }
 
+    // Add a method to explicitly close files
+    fn close_files(&mut self) -> io::Result<()> {
+        self.data_files.clear();
+        Ok(())
+    }
+
     pub fn finalize(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        self.close_files()?;
+
         // Write index to file
         let index_path = if let Some(ref key) = self.key {
             self.directory.join(key).join(Self::INDEX_FILENAME)
@@ -157,19 +188,17 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
     pub fn open_chrom_file(&mut self, chrom: &str) -> std::io::Result<()> {
         if !self.data_files.contains_key(chrom) {
             let data_path = self.get_data_path(chrom);
-            let mut file = File::open(&data_path)?;
+            let file = File::open(&data_path)?;
+            let mmap = unsafe { Mmap::map(&file)? };
 
-            // Verify magic number
-            let mut magic = [0u8; 4];
-            file.read_exact(&mut magic)?;
-            if magic != Self::MAGIC {
+            if mmap[0..4] != Self::MAGIC {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "Invalid file format",
                 ));
             }
-
-            self.data_files.insert(chrom.to_string(), file);
+            self.data_files
+                .insert(chrom.to_string(), FileHandle::Read(mmap));
         }
         Ok(())
     }
@@ -200,20 +229,23 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
             return Ok(results);
         }
 
-        let file = self.data_files.get_mut(chrom).unwrap();
+        let mmap = match self.data_files.get(chrom).unwrap() {
+            FileHandle::Read(mmap) => mmap,
+            FileHandle::Write(_) => {
+                return Err(HgIndexError::StringError("File is open for writing".into()))
+            }
+        };
 
         for offset in self.index.find_overlapping(chrom, start, end) {
-            file.seek(SeekFrom::Start(offset)).unwrap();
-
-            // First read the length (8 bytes)
-            let mut length_bytes = [0u8; 8];
-            if file.read_exact(&mut length_bytes).is_ok() {
-                let length = u64::from_le_bytes(length_bytes);
-
-                // Now read the actual record
-                let mut record_data = vec![0u8; length as usize];
-                if file.read_exact(&mut record_data).is_ok() {
-                    if let Ok(record) = bincode::deserialize(&record_data) {
+            let offset = offset as usize;
+            if offset + 8 <= mmap.len() {
+                // Read length
+                let length =
+                    u64::from_le_bytes(mmap[offset..offset + 8].try_into().unwrap()) as usize;
+                if offset + 8 + length <= mmap.len() {
+                    // Read record
+                    if let Ok(record) = bincode::deserialize(&mmap[offset + 8..offset + 8 + length])
+                    {
                         results.push(record);
                     }
                 }

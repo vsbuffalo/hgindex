@@ -3,11 +3,29 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const BEDSIZE: u32 = 50_000_000;
+// const BEDSIZE: u32 = 1_000_000;
+
+fn check_tool_exists(tool: &str) -> Result<(), Box<dyn std::error::Error>> {
+    match Command::new(tool).arg("--version").output() {
+        Ok(output) => {
+            println!(
+                "{} version: {}",
+                tool,
+                String::from_utf8_lossy(&output.stdout)
+            );
+            Ok(())
+        }
+        Err(e) => Err(format!("{} not found: {}", tool, e).into()),
+    }
+}
 
 #[test]
 fn test_tabix_compatibility() -> Result<(), Box<dyn std::error::Error>> {
+    check_tool_exists("bgzip")?;
+    check_tool_exists("tabix")?;
+
     // Set up paths
-    let test_dir = PathBuf::from("target/test_files");
+    let test_dir = PathBuf::from("target/test_files").canonicalize()?;
     let test_bed = test_dir.join("test.bed");
     let bgzipped = test_dir.join("test.bed.bgz");
     let hgindex = test_dir.join("test.hgidx");

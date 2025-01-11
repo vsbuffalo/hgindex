@@ -2,13 +2,51 @@
 
 # hgindex — hierarchical genome index (& binary store!)
 
-A *beta* flexible genomic range binning index with optional indexed binary
-serialization of arbitrary types (using
+A *beta* flexible genomic range binning index with *uncompressed* indexed
+binary serialization of arbitrary types (using
 [bincode](https://github.com/bincode-org/bincode)) implementation in Rust.
+Tabix-like block compression is the branch `block-compression`, but is
+currently quite slow for the particular task I've needed this for, and still
+experimental.
 
-This is based on the UCSC genome browser's hierarchical binning scheme (also
-used by Heng Li's [tabix](https://pmc.ncbi.nlm.nih.gov/articles/PMC3042176/))
-but allows for custom binning configurations.
+This binning is based on the UCSC genome browser's hierarchical binning scheme
+(also used by Heng Li's
+[tabix](https://pmc.ncbi.nlm.nih.gov/articles/PMC3042176/)) but allows for
+custom binning configurations. However, the full index (i.e. all range, rather
+than ranges of virtual offsets) is currently used now (the `block-compression`
+uses the tabix-like offset range though).
+
+The current version is not block compressed, which allows for direct memory
+mapping. This is on the other side of the disk-space / query-speed tradeoff
+than tabix. Here are some preliminary query benchmarks, using the UCSC repeat
+masker track as the database, and the UCSC RefGene track as the query:
+
+```
+$ hyperfine --warmup 3 \
+  './target/release/hgidx  query --regions tests/data/refgene.bed --input tests/data/repeat_masker.hgidx > /dev/null' \
+  'tabix tests/data/repeat_masker.bed.bgz --regions tests/data/refgene.bed > /dev/null'
+    Finished `release` profile [optimized] target(s) in 0.19s
+Benchmark 1: ./target/release/hgidx  query --regions tests/data/refgene.bed --input tests/data/repeat_masker.hgidx > /dev/null
+  Time (mean ± σ):      2.158 s ±  0.015 s    [User: 2.047 s, System: 0.082 s]
+  Range (min … max):    2.140 s …  2.181 s    10 runs
+
+Benchmark 2: tabix tests/data/repeat_masker.bed.bgz --regions tests/data/refgene.bed > /dev/null
+  Time (mean ± σ):      3.920 s ±  0.035 s    [User: 3.785 s, System: 0.091 s]
+  Range (min … max):    3.876 s …  3.991 s    10 runs
+
+Summary
+  ./target/release/hgidx  query --regions tests/data/refgene.bed --input tests/data/repeat_masker.hgidx > /dev/null ran
+    1.82 ± 0.02 times faster than tabix tests/data/repeat_masker.bed.bgz --regions tests/data/refgene.bed > /dev/null
+
+$ du -h tests/data/repeat_masker.hgidx
+622M tests/data/repeat_masker.hgidx
+
+$ du -h tests/data/repeat_masker.bed.bgz
+144M     tests/data/repeat_masker.bed.bgz
+```
+
+So presently hgindex is about 1.8x faster than tabix, with about 4.3x the disk
+usage.
 
 **Warning**: the API and name of this project may change as it is developed.
 Please give feedback, suggestions, and reach out if you'd like to contribute.
@@ -24,31 +62,20 @@ Please give feedback, suggestions, and reach out if you'd like to contribute.
   [serde](https://serde.rs)
 - Support for optional index-level metadata storage (e.g. for storing mapping
   between chromosome names and indices, etc)
+- Simple command line tool for working with BED-like files (mostly for testing/benchmarks)
 
-## Implementation Details
+## Command line tool
 
-The index uses a hierarchical binning strategy where genomic ranges are
-assigned to bins based on their size. The default configuration matches UCSC:
+There is a simple, optional command line tool (use `--features=cli` when
+installing to enable), primarily for integration/validation tests and
+benchmarks against tabix's results.
 
-- 5 levels with 8x scaling between levels
-- Base bin size of 128kb
-- Level bin counts: 4096, 512, 64, 8, 1
-
-Custom configurations available:
-```rust
-// Default UCSC scheme
-let bins = HierarchicalBins::ucsc();  // 128kb base, 8x scaling, 5 levels
-
-// Higher resolution scheme
-let dense = HierarchicalBins::dense();  // 16kb base, 4x scaling, 6 levels
-
-// Custom scheme
-let custom = HierarchicalBins::new(
-    17,  // base_shift (128kb bins)
-    3,   // level_shift (8x scaling)
-    5    // num_levels
-);
 ```
+$ hgindex pack tests/data/repeat_masker.bed        # serialie the BED records and index
+$ hgidx  query --regions tests/data/refgene.bed    # query a set of ranges
+$ hgidx  query chr2:4131233-4131233                # query a single range
+```
+
 
 ## Usage
 
@@ -96,8 +123,4 @@ store.set_metadata(Metadata {
 });
 ```
 
-## Performance
-
-Lookups are quite fast, but because bincode isn't as efficient as packed C
-structures, there is some disk overhead.
 
