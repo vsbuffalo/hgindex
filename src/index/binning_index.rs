@@ -47,9 +47,19 @@ where
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SequenceIndex {
     // Map from bin ID to u64, which can be used as a VirtualOffset.
-    pub bins: FxHashMap<u32, (u64, u64)>,
+    pub bins: FxHashMap<u32, Vec<Feature>>,
     // Linear index for quick region queries
     pub linear_index: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Feature {
+    /// Start position.
+    start: u32,
+    /// End position.
+    end: u32,
+    /// The feature index (e.g. a file offset).
+    index: u64,
 }
 
 impl<M> Default for BinningIndex<M>
@@ -105,31 +115,66 @@ where
 
     /// Add a feature, a range with a file
     pub fn add_feature(&mut self, chrom: &str, start: u32, end: u32, index: u64) {
-        let binning = HierarchicalBins::from_schema(&self.schema);
+        let binning = HierarchicalBins::default();
         let bin_id = binning.region_to_bin(start, end);
 
-        // Get or create the sequence index.
+        // the chromosome-level index
         let bin_index = self.sequences.entry(chrom.to_string()).or_default();
 
-        let bin_range = bin_index.bins.entry(bin_id).or_insert((u64::MAX, 0));
-        bin_range.0 = bin_range.0.min(index); // Update the start offset of the range
-        bin_range.1 = bin_range.1.max(index); // Update the end offset of the range
+        // make the feature
+        let feature = Feature { start, end, index };
 
-        if self.use_linear_index {
-            let start_window = start >> binning.linear_shift;
-            let end_window = (end - 1) >> binning.linear_shift;
+        // insert the feature
+        bin_index.bins.entry(bin_id).or_default().push(feature);
 
-            if end_window >= bin_index.linear_index.len() as u32 {
-                bin_index
-                    .linear_index
-                    .resize(end_window as usize + 1, u64::MAX);
+        // Update linear index
+        let linear_idx = start >> binning.linear_shift;
+        if linear_idx >= bin_index.linear_index.len() as u32 {
+            bin_index
+                .linear_index
+                .resize(linear_idx as usize + 1, u64::MAX);
+        }
+        bin_index.linear_index[linear_idx as usize] =
+            bin_index.linear_index[linear_idx as usize].min(index);
+    }
+
+    /// Return the indices (e.g. file offsets) of all ranges that overlap with the supplied range.
+    pub fn find_overlapping(&self, chrom: &str, start: u32, end: u32) -> Vec<u64> {
+        let Some(chrom_index) = self.sequences.get(chrom) else {
+            return vec![];
+        };
+
+        let binning = HierarchicalBins::default();
+        let bins_to_check = binning.region_to_bins(start, end);
+
+        let mut overlapping = Vec::new();
+
+        // Use linear index to find minimum file offset to start checking
+        let min_offset = {
+            let linear_idx = start >> binning.linear_shift;
+            let max_linear_idx = chrom_index.linear_index.len();
+            if linear_idx < max_linear_idx as u32 {
+                chrom_index.linear_index[linear_idx as usize]
+            } else {
+                // If we're beyond the end of the linear index, there can't be any features
+                // that overlap this region, so return an empty vector
+                return vec![];
             }
+        };
 
-            for window in start_window..=end_window {
-                bin_index.linear_index[window as usize] =
-                    bin_index.linear_index[window as usize].min(index);
+        for bin_id in bins_to_check {
+            if let Some(features) = chrom_index.bins.get(&bin_id) {
+                for feature in features {
+                    if feature.index >= min_offset && feature.start < end && feature.end > start {
+                        overlapping.push(feature.index);
+                    }
+                }
             }
         }
+
+        overlapping.sort_unstable();
+        overlapping.dedup();
+        overlapping
     }
 
     /// Return the range of offsets that could contain an overlapping range.
@@ -159,11 +204,11 @@ where
 
         // Look through all potentially overlapping bins
         for bin_id in bins_to_check {
-            if let Some(&(bin_min, bin_max)) = chrom_index.bins.get(&bin_id) {
-                if bin_min != u64::MAX {
+            if let Some(features) = chrom_index.bins.get(&bin_id) {
+                for feature in features {
                     // Check if bin contains any features
-                    min_offset = min_offset.min(bin_min);
-                    max_offset = max_offset.max(bin_max);
+                    min_offset = min_offset.min(feature.index);
+                    max_offset = max_offset.max(feature.index);
                 }
             }
         }
@@ -270,3 +315,4 @@ mod tests {
         assert!(range.1 >= 200); // Should include second feature
     }
 }
+
