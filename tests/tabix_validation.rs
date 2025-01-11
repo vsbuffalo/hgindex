@@ -25,7 +25,11 @@ fn test_tabix_compatibility() -> Result<(), Box<dyn std::error::Error>> {
     check_tool_exists("tabix")?;
 
     // Set up paths
-    let test_dir = PathBuf::from("target/test_files").canonicalize()?;
+    let test_dir = PathBuf::from("target/test_files");
+    // Create test directory
+    fs::create_dir_all(&test_dir)?;
+    // Now, can canonicalize after creating
+    let test_dir = test_dir.canonicalize()?;
     let test_bed = test_dir.join("test.bed");
     let bgzipped = test_dir.join("test.bed.bgz");
     let hgindex = test_dir.join("test.hgidx");
