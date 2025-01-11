@@ -315,4 +315,3 @@ mod tests {
         assert!(range.1 >= 200); // Should include second feature
     }
 }
-
