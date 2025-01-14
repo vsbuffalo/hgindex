@@ -1,12 +1,12 @@
 // bin/commands/query.rs
 
-use crate::commands::BedRecord;
 use clap::Args;
 use csv::ReaderBuilder;
 use flate2::Compression;
 use hgindex::error::HgIndexError;
 use hgindex::io::OutputStream;
 use hgindex::store::GenomicDataStore;
+use hgindex::BedRecord;
 use std::fmt::Write;
 use std::fs;
 use std::fs::File;

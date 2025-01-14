@@ -4,11 +4,13 @@ pub mod error;
 pub mod index;
 #[cfg(feature = "cli")]
 pub mod io;
+pub mod records;
 pub mod store;
 
 pub use index::{BinningIndex, BinningSchema, Feature, HierarchicalBins, SequenceIndex};
 #[cfg(feature = "cli")]
 pub use io::*;
+pub use records::*;
 pub use store::GenomicDataStore;
 
 #[cfg(test)]
@@ -24,8 +26,4 @@ pub trait GenomicCoordinates {
 
     /// Get the end coordinate (0-based, exclusive)
     fn end(&self) -> u32;
-}
-
-pub trait DataRecord {
-    fn write_tsv_line<W: std::io::Write>(&self, writer: &mut W) -> Result<(), std::io::Error>;
 }

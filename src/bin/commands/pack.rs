@@ -1,11 +1,11 @@
 // bin/commands/pack.rs
 
-use crate::commands::BedRecord;
 use clap::Args;
 use csv::ReaderBuilder;
 use flate2::read::GzDecoder;
 use hgindex::error::HgIndexError;
 use hgindex::store::GenomicDataStore;
+use hgindex::BedRecord;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
