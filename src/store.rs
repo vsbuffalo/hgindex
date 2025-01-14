@@ -28,6 +28,7 @@ where
     data_files: HashMap<String, FileHandle>,
     directory: PathBuf,
     key: Option<String>,
+    results_buffer: Vec<T>,
     _phantom: PhantomData<T>,
 }
 
@@ -61,6 +62,7 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
             data_files: HashMap::new(),
             directory: directory.to_path_buf(),
             key,
+            results_buffer: Vec::with_capacity(1000),
             _phantom: PhantomData,
         })
     }
@@ -106,7 +108,7 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
         self.index.metadata.take()
     }
 
-    pub fn add_record(&mut self, chrom: &str, record: &T) -> std::io::Result<()> {
+    pub fn add_record(&mut self, chrom: &str, record: &T) -> Result<(), HgIndexError> {
         // If this is a new chromosome and we already have some files open,
         // close the previous chromosome's file
         if !self.data_files.contains_key(chrom) {
@@ -136,7 +138,7 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
         // Add the feature to the index now.
         let start = record.start();
         let end = record.end();
-        self.index.add_feature(chrom, start, end, offset);
+        self.index.add_feature(chrom, start, end, offset)?;
 
         Ok(())
     }
@@ -181,6 +183,7 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
             data_files: HashMap::new(),
             directory: directory.to_path_buf(),
             key,
+            results_buffer: Vec::with_capacity(1000),
             _phantom: PhantomData,
         })
     }
@@ -203,30 +206,113 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
         Ok(())
     }
 
+    /// Batch-based get_overlapping()
+    pub fn get_overlapping_batch(
+        &mut self,
+        chrom: &str,
+        start: u32,
+        end: u32,
+    ) -> Result<&[T], HgIndexError> {
+        // First, clear the shared buffer
+
+        self.results_buffer.clear();
+        if end <= start {
+            return Err(HgIndexError::InvalidInterval { start, end });
+        }
+        if !self.index.sequences.contains_key(chrom) {
+            return Ok(&self.results_buffer);
+        }
+
+        if self.open_chrom_file(chrom).is_err() {
+            return Ok(&self.results_buffer);
+        }
+
+        let mmap = match self.data_files.get(chrom).unwrap() {
+            FileHandle::Read(mmap) => mmap,
+            FileHandle::Write(_) => {
+                return Err(HgIndexError::StringError("File is open for writing".into()))
+            }
+        };
+
+        let offsets = self.index.find_overlapping(chrom, start, end);
+        if offsets.is_empty() {
+            return Ok(&self.results_buffer);
+        }
+
+        // Get range for batch processing
+        let first_offset = offsets[0] as usize;
+        let last_offset = offsets[offsets.len() - 1] as usize;
+
+        // Read length at last position to know total range
+        let last_length =
+            u64::from_le_bytes(mmap[last_offset..last_offset + 8].try_into().unwrap()) as usize;
+        // This didn't speed things up much behind the try_into().
+        //let last_length = unsafe {
+        //    // Read 8 bytes as a u64 from the mmap slice at the given position
+        //    ptr::read_unaligned(mmap.as_ptr().add(last_offset) as *const usize)
+        //};
+
+        let region_end = last_offset + 8 + last_length;
+
+        // Pre-allocate results
+        self.results_buffer.reserve(offsets.len());
+
+        // Process records in range
+        let mut current_offset = first_offset;
+        while current_offset < region_end {
+            if current_offset + 8 > mmap.len() {
+                break;
+            }
+            let length =
+                u64::from_le_bytes(mmap[current_offset..current_offset + 8].try_into().unwrap())
+                    as usize;
+            // This didn't speed things up much behind the try_into().
+            // let length = unsafe { ptr::read_unaligned(mmap.as_ptr().add(current_offset) as *const usize) };
+
+            if current_offset + 8 + length > mmap.len() {
+                break;
+            }
+
+            // Only deserialize if this offset is in our overlaps list
+            if offsets.binary_search(&(current_offset as u64)).is_ok() {
+                if let Ok(record) =
+                    bincode::deserialize(&mmap[current_offset + 8..current_offset + 8 + length])
+                {
+                    self.results_buffer.push(record);
+                } else {
+                    panic!("Error deserializing record at {}!", current_offset + 8);
+                }
+            }
+            current_offset += 8 + length;
+        }
+
+        Ok(&self.results_buffer)
+    }
+
     /// The features overlapping the range with this start and end position.
     pub fn get_overlapping(
         &mut self,
         chrom: &str,
         start: u32,
         end: u32,
-    ) -> Result<Vec<T>, HgIndexError> {
+    ) -> Result<&[T], HgIndexError> {
+        self.results_buffer.clear();
         if end <= start {
             return Err(HgIndexError::InvalidInterval { start, end });
         }
         // Early return empty vec if chromosome not in index
         if !self.index.sequences.contains_key(chrom) {
-            return Ok(Vec::new());
+            return Ok(&self.results_buffer);
         }
-        let mut results = Vec::new();
 
         // Early return if chromosome not in index
         if !self.index.sequences.contains_key(chrom) {
-            return Ok(results);
+            return Ok(&self.results_buffer);
         }
 
         // Open chromosome file if not already open
         if self.open_chrom_file(chrom).is_err() {
-            return Ok(results);
+            return Ok(&self.results_buffer);
         }
 
         let mmap = match self.data_files.get(chrom).unwrap() {
@@ -237,7 +323,7 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
         };
 
         for offset in self.index.find_overlapping(chrom, start, end) {
-            let offset = offset as usize;
+            let offset = *offset as usize;
             if offset + 8 <= mmap.len() {
                 // Read length
                 let length =
@@ -246,12 +332,12 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
                     // Read record
                     if let Ok(record) = bincode::deserialize(&mmap[offset + 8..offset + 8 + length])
                     {
-                        results.push(record);
+                        self.results_buffer.push(record);
                     }
                 }
             }
         }
-        Ok(results)
+        Ok(&self.results_buffer)
     }
 }
 

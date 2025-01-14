@@ -7,6 +7,7 @@ use flate2::Compression;
 use hgindex::error::HgIndexError;
 use hgindex::io::OutputStream;
 use hgindex::store::GenomicDataStore;
+use std::fmt::Write;
 use std::fs;
 use std::fs::File;
 use std::path::PathBuf;
@@ -87,12 +88,26 @@ fn query_single_region<W: std::io::Write>(
     output_writer: &mut W,
 ) -> Result<(), HgIndexError> {
     let (seqname, start, end) = parse_region(region)?;
-    let records = store.get_overlapping(seqname, start, end)?;
+    // let records = store.get_overlapping(seqname, start, end)?;
+    let records = store.get_overlapping_batch(seqname, start, end)?;
+
+    // Re-usable line buffer
+    let mut line_buffer = String::new();
+
     eprintln!("{} records found.", records.len());
 
+    // Write all matching records to output at once
     for record in records {
-        writeln!(output_writer, "{}", record)?;
+        line_buffer.clear(); // Clear the buffer for the next record
+        write!(
+            line_buffer,
+            "{}\t{}\t{}\t{}",
+            record.chrom, record.start, record.end, record.rest
+        )
+        .unwrap();
+        writeln!(output_writer, "{}", line_buffer)?; // Write the record
     }
+
     Ok(())
 }
 
@@ -108,6 +123,8 @@ fn query_bed_regions<W: std::io::Write>(
         .from_reader(File::open(regions_file)?);
 
     let mut total_records = 0;
+    // Re-usable line buffer
+    let mut line_buffer = String::new();
 
     for record in reader.records() {
         let record = record?;
@@ -124,11 +141,19 @@ fn query_bed_regions<W: std::io::Write>(
             .parse()
             .map_err(|_| "Invalid end coordinate")?;
 
-        let records = store.get_overlapping(chrom, start, end)?;
+        let records = store.get_overlapping_batch(chrom, start, end)?;
         total_records += records.len();
 
+        // Write all matching records to output at once
         for record in records {
-            writeln!(output_writer, "{}", record)?;
+            line_buffer.clear(); // Clear the buffer for the next record
+            write!(
+                line_buffer,
+                "{}\t{}\t{}\t{}",
+                record.chrom, record.start, record.end, record.rest
+            )
+            .unwrap();
+            writeln!(output_writer, "{}", line_buffer)?; // Write the record
         }
     }
 

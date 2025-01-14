@@ -13,6 +13,14 @@ pub enum HgIndexError {
     #[error("GenomicDataStore has already been finalized.")]
     AlreadyFinalized,
 
+    #[error("Unsorted features in bin {bin_id} of sequence {chrom}. Found position {current} after {previous}")]
+    UnsortedFeatures {
+        chrom: String,
+        bin_id: u32,
+        previous: u32,
+        current: u32,
+    },
+
     #[error("IO error: {0}")]
     IOError(#[from] std::io::Error),
 

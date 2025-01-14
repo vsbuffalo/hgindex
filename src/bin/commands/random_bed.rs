@@ -5,7 +5,7 @@ use clap::Args;
 use hgindex::error::HgIndexError;
 use hgindex::io::OutputStream;
 use rand::{seq::SliceRandom, Rng, SeedableRng};
-use std::io::Write;
+use std::fmt::Write;
 use std::path::PathBuf;
 
 #[derive(Args)]
@@ -33,7 +33,7 @@ pub fn run(args: RandomBedArgs) -> Result<(), HgIndexError> {
     );
 
     let output = OutputStream::new(args.output);
-    let mut writer = output.writer()?;
+    let mut output_writer = output.writer()?;
 
     //// Write header comments
     //writeln!(
@@ -45,8 +45,19 @@ pub fn run(args: RandomBedArgs) -> Result<(), HgIndexError> {
 
     // Generate and write records
     let records = generate_random_bed_records(args.num_records, args.seed);
+
+    // Re-usable line buffer
+    let mut line_buffer = String::new();
+
     for record in records {
-        writeln!(writer, "{}", record)?;
+        line_buffer.clear(); // Clear the buffer for the next record
+        write!(
+            line_buffer,
+            "{}\t{}\t{}\t{}",
+            record.chrom, record.start, record.end, record.rest
+        )
+        .unwrap();
+        writeln!(output_writer, "{}", line_buffer)?; // Write the record
     }
 
     eprintln!("Done!");
@@ -165,11 +176,12 @@ mod tests {
     }
 
     #[test]
-    fn test_output_file_creation() -> Result<(), RandomBedError> {
+    fn test_output_file_creation() -> Result<(), HgIndexError> {
         let test_file = NamedTempFile::new().unwrap();
         let args = RandomBedArgs {
-            output: test_file.path().to_path_buf(),
+            output: Some(test_file.path().to_path_buf()),
             num_records: 10,
+            seed: Some(42),
         };
 
         run(args)?;
@@ -179,8 +191,7 @@ mod tests {
         file.read_to_string(&mut content)?;
 
         let lines: Vec<&str> = content.lines().collect();
-        assert!(lines.len() >= 12); // 2 comment lines + 10 records
-        assert!(lines[0].starts_with('#'));
+        assert_eq!(lines.len(), 10); // 2 comment lines + 10 records
 
         Ok(())
     }

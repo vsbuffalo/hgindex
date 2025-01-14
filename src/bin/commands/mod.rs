@@ -9,9 +9,8 @@ pub mod random_bed;
 
 use hgindex::GenomicCoordinates;
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, PartialEq, Deserialize)]
 pub struct BedRecord {
     pub chrom: String,
     pub start: u32,
@@ -26,16 +25,5 @@ impl GenomicCoordinates for BedRecord {
 
     fn end(&self) -> u32 {
         self.end
-    }
-}
-
-impl fmt::Display for BedRecord {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // Format the record as a TSV (tab-separated values) line
-        write!(
-            f,
-            "{}\t{}\t{}\t{}",
-            self.chrom, self.start, self.end, self.rest
-        )
     }
 }

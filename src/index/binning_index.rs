@@ -3,7 +3,7 @@
 use std::{fs::File, io::BufWriter, path::Path};
 
 use super::binning::{BinningSchema, HierarchicalBins};
-use crate::SerdeType;
+use crate::{error::HgIndexError, SerdeType};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +18,9 @@ where
     pub sequences: FxHashMap<String, SequenceIndex>,
     pub metadata: Option<M>,
     pub use_linear_index: bool,
+    last_chrom: Option<String>,
+    last_start: Option<u32>,
+    overlap_buffer: Vec<u64>,
 }
 
 // Implement Deserialize manually to handle the lifetime bounds correctly
@@ -29,7 +32,7 @@ where
     where
         D: serde::Deserializer<'de>,
     {
-        let (schema, sequences, metadata, use_linear_index) =
+        let (schema, sequences, metadata, use_linear_index, last_chrom, last_start) =
             serde::Deserialize::deserialize(deserializer)?;
 
         Ok(BinningIndex {
@@ -37,6 +40,9 @@ where
             sequences,
             metadata,
             use_linear_index,
+            last_chrom,
+            last_start,
+            overlap_buffer: Vec::with_capacity(1000),
         })
     }
 }
@@ -81,6 +87,9 @@ where
             sequences: FxHashMap::default(),
             metadata: None,
             use_linear_index: true,
+            last_chrom: None,
+            last_start: None,
+            overlap_buffer: Vec::with_capacity(1000),
         }
     }
 
@@ -90,6 +99,9 @@ where
             sequences: FxHashMap::default(),
             metadata: None,
             use_linear_index: true,
+            last_chrom: None,
+            last_start: None,
+            overlap_buffer: Vec::with_capacity(1000),
         }
     }
 
@@ -114,7 +126,30 @@ where
     }
 
     /// Add a feature, a range with a file
-    pub fn add_feature(&mut self, chrom: &str, start: u32, end: u32, index: u64) {
+    pub fn add_feature(
+        &mut self,
+        chrom: &str,
+        start: u32,
+        end: u32,
+        index: u64,
+    ) -> Result<(), HgIndexError> {
+        // Check sorting - compare chrom first, then start, then end
+        if let (Some(last_chrom), Some(last_start)) = (&self.last_chrom, self.last_start) {
+            if last_chrom == chrom && last_start > start {
+                // check start position is not decreasing
+                return Err(HgIndexError::UnsortedFeatures {
+                    chrom: chrom.to_string(),
+                    bin_id: 0,
+                    previous: last_start,
+                    current: start,
+                });
+            }
+        }
+
+        // Update tracking
+        self.last_chrom = Some(chrom.to_string());
+        self.last_start = Some(start);
+
         let binning = HierarchicalBins::default();
         let bin_id = binning.region_to_bin(start, end);
 
@@ -136,18 +171,20 @@ where
         }
         bin_index.linear_index[linear_idx as usize] =
             bin_index.linear_index[linear_idx as usize].min(index);
+        Ok(())
     }
 
     /// Return the indices (e.g. file offsets) of all ranges that overlap with the supplied range.
-    pub fn find_overlapping(&self, chrom: &str, start: u32, end: u32) -> Vec<u64> {
+    pub fn find_overlapping(&mut self, chrom: &str, start: u32, end: u32) -> &[u64] {
+        // First, clear the shared buffer
+        self.overlap_buffer.clear();
+
         let Some(chrom_index) = self.sequences.get(chrom) else {
-            return vec![];
+            return &self.overlap_buffer;
         };
 
         let binning = HierarchicalBins::default();
         let bins_to_check = binning.region_to_bins(start, end);
-
-        let mut overlapping = Vec::new();
 
         // Use linear index to find minimum file offset to start checking
         let min_offset = {
@@ -158,13 +195,23 @@ where
             } else {
                 // If we're beyond the end of the linear index, there can't be any features
                 // that overlap this region, so return an empty vector
-                return vec![];
+                return &self.overlap_buffer;
             }
         };
 
+        let overlapping = &mut self.overlap_buffer;
         for bin_id in bins_to_check {
             if let Some(features) = chrom_index.bins.get(&bin_id) {
                 for feature in features {
+                    // Stop if we've gone past possible overlaps, since features is sorted.
+                    if feature.start >= end {
+                        break; // No more features in this bin can overlap
+                    }
+
+                    // Check for actual overlaps at the index-level.
+                    // This differs a bit from tabix + bgzip, which ranges
+                    // with virtual offsets, and has to decompress and compare everything in
+                    // a block overlapping that virtual offset range.
                     if feature.index >= min_offset && feature.start < end && feature.end > start {
                         overlapping.push(feature.index);
                     }
@@ -172,8 +219,6 @@ where
             }
         }
 
-        overlapping.sort_unstable();
-        overlapping.dedup();
         overlapping
     }
 
@@ -256,9 +301,9 @@ mod tests {
         let mut index = BinningIndex::new();
 
         // Add features with the indices
-        index.add_feature("chr1", 1000, 2000, 100);
-        index.add_feature("chr1", 1500, 2500, 200);
-        index.add_feature("chr1", 5000, 6000, 300);
+        index.add_feature("chr1", 1000, 2000, 100).unwrap();
+        index.add_feature("chr1", 1500, 2500, 200).unwrap();
+        index.add_feature("chr1", 5000, 6000, 300).unwrap();
 
         index
     }
@@ -290,7 +335,7 @@ mod tests {
             let start = i * 16384; // Use bin size as interval
             let end = (i + 1) * 16384;
             let offset = u64::from(i * 100);
-            index.add_feature("chr1", start, end, offset);
+            index.add_feature("chr1", start, end, offset).unwrap();
         }
 
         // Test that linear index provides valid bounds
@@ -306,12 +351,64 @@ mod tests {
         let mut index = BinningIndex::<()>::new();
 
         // Add features at bin boundaries
-        index.add_feature("chr1", 0, 16384, 100); // Exactly one level 1 bin
-        index.add_feature("chr1", 16384, 32768, 200); // Next level 1 bin
+        index.add_feature("chr1", 0, 16384, 100).unwrap(); // Exactly one level 1 bin
+        index.add_feature("chr1", 16384, 32768, 200).unwrap(); // Next level 1 bin
 
         // Query across bin boundary - both bins should be included as candidates
         let range = index.get_candidate_offsets("chr1", 16000, 17000).unwrap();
         assert!(range.0 <= 100); // Should include first feature
         assert!(range.1 >= 200); // Should include second feature
+    }
+
+    #[test]
+    fn test_feature_ordering() {
+        let mut index = BinningIndex::<()>::new();
+
+        // Test basic ordering works
+        assert!(index.add_feature("chr1", 1000, 2000, 100).is_ok());
+        assert!(index.add_feature("chr1", 2000, 3000, 200).is_ok());
+
+        // Test same start different end
+        assert!(index.add_feature("chr2", 1000, 2000, 300).is_ok());
+        assert!(index.add_feature("chr2", 1000, 2500, 400).is_ok());
+
+        // Test chromosome transitions
+        assert!(index.add_feature("chr2", 5000, 6000, 500).is_ok());
+        assert!(index.add_feature("chr3", 1000, 2000, 600).is_ok());
+
+        // Test errors
+        let mut index = BinningIndex::<()>::new();
+
+        // Setup initial feature
+        assert!(index.add_feature("chr1", 2000, 3000, 100).is_ok());
+
+        // Test earlier start fails
+        assert!(matches!(
+            index.add_feature("chr1", 1000, 2000, 200),
+            Err(HgIndexError::UnsortedFeatures {
+                chrom: _,
+                bin_id: _,
+                previous: 2000,
+                current: 1000
+            })
+        ));
+    }
+
+    #[test]
+    fn test_feature_ordering_with_ties() {
+        let mut index = BinningIndex::<()>::new();
+
+        // Test ties are okay
+        assert!(index.add_feature("chr1", 1000, 2000, 100).is_ok());
+        assert!(index.add_feature("chr1", 1000, 2000, 200).is_ok()); // Exact tie ok
+        assert!(index.add_feature("chr1", 1000, 2000, 300).is_ok()); // Multiple ties ok
+
+        // Test we can continue after ties
+        assert!(index.add_feature("chr1", 1000, 2500, 400).is_ok()); // Same start, longer end
+        assert!(index.add_feature("chr1", 2000, 3000, 500).is_ok()); // Progress after ties
+
+        // Test chromosome transitions with ties
+        assert!(index.add_feature("chr2", 1000, 2000, 600).is_ok());
+        assert!(index.add_feature("chr2", 1000, 2000, 700).is_ok()); // Tie on new chrom
     }
 }

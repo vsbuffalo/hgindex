@@ -1,7 +1,7 @@
 #[cfg(feature = "cli")]
 mod commands;
 
-#[cfg(feature = "dev")]
+//#[cfg(all(feature="dev", feature = "dev"))]
 use crate::commands::random_bed;
 //#[cfg(all(feature = "dev"))]
 //use crate::commands::analyze;
