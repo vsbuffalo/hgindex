@@ -123,13 +123,11 @@ fn query_bed_regions<W: std::io::Write>(
         .from_reader(File::open(regions_file)?);
 
     let mut total_records = 0;
-    // Re-usable line buffer
-    let mut line_buffer = String::new();
+    let mut writer = output_writer; // Create local mutable binding
 
     for record in reader.records() {
         let record = record?;
         let chrom = record.get(0).ok_or("Missing chrom")?;
-        // Convert to 0-based coordinates
         let start: u32 = record
             .get(1)
             .ok_or("Missing start")?
@@ -141,23 +139,22 @@ fn query_bed_regions<W: std::io::Write>(
             .parse()
             .map_err(|_| "Invalid end coordinate")?;
 
-        let records = store.get_overlapping_batch(chrom, start, end)?;
-        total_records += records.len();
+        let records_found = store.map_overlapping_batch(chrom, start, end, |bytes| {
+            write_tsv_bytes(bytes, &mut writer)
+        })?;
 
-        // Write all matching records to output at once
-        for record in records {
-            line_buffer.clear(); // Clear the buffer for the next record
-            write!(
-                line_buffer,
-                "{}\t{}\t{}\t{}",
-                record.chrom, record.start, record.end, record.rest
-            )
-            .unwrap();
-            writeln!(output_writer, "{}", line_buffer)?; // Write the record
-        }
+        total_records += records_found;
     }
 
-    eprintln!("{} total records found.", total_records);
+    eprintln!("Found {} total records.", total_records);
+    Ok(())
+}
+
+fn write_tsv_bytes<W: std::io::Write>(bytes: &[u8], writer: &mut W) -> Result<(), HgIndexError> {
+    // Assuming your serialized format matches your TSV format
+    // If not, you'll need custom parsing logic here
+    writer.write_all(bytes)?;
+    writer.write_all(b"\n")?;
     Ok(())
 }
 

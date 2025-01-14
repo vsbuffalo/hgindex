@@ -25,3 +25,7 @@ pub trait GenomicCoordinates {
     /// Get the end coordinate (0-based, exclusive)
     fn end(&self) -> u32;
 }
+
+pub trait DataRecord {
+    fn write_tsv_line<W: std::io::Write>(&self, writer: &mut W) -> Result<(), std::io::Error>;
+}

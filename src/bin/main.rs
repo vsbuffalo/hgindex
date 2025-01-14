@@ -1,7 +1,7 @@
 #[cfg(feature = "cli")]
 mod commands;
 
-//#[cfg(all(feature="dev", feature = "dev"))]
+#[cfg(all(feature = "cli", feature = "dev"))]
 use crate::commands::random_bed;
 //#[cfg(all(feature = "dev"))]
 //use crate::commands::analyze;
@@ -25,7 +25,7 @@ enum Commands {
     /// Block-compress and index a file.
     Pack(pack::PackArgs),
     Query(query::QueryArgs),
-    #[cfg(feature = "dev")]
+    #[cfg(all(feature = "cli", feature = "dev"))]
     /// Generate a random BED file for benchmarking (only with dev feature)
     RandomBed(random_bed::RandomBedArgs),
 }
