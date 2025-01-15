@@ -1,6 +1,8 @@
 // error.rs
 
 #[cfg(feature = "cli")]
+use glob::glob;
+#[cfg(feature = "cli")]
 use indicatif::style::TemplateError;
 use std::num::ParseIntError;
 use thiserror::Error;
@@ -43,10 +45,13 @@ pub enum HgIndexError {
     ParseIntError(#[from] ParseIntError),
 
     #[error("Internal error: {0}")]
-    BoxError(#[from] Box<dyn std::error::Error>),
+    BoxError(#[from] Box<dyn std::error::Error + Send + Sync>),
 
     #[error("{0}")]
     StringError(String),
+
+    #[error("Bincode error: {0}")]
+    BincodeError(String),
 
     #[cfg(feature = "cli")]
     #[error("CSV error: {0}")]
@@ -64,9 +69,21 @@ impl From<&str> for HgIndexError {
     }
 }
 
-// Add a convenience implementation for string errors
-impl From<String> for HgIndexError {
-    fn from(error: String) -> Self {
-        HgIndexError::StringError(error)
+impl From<Box<dyn std::error::Error>> for HgIndexError {
+    fn from(error: Box<dyn std::error::Error>) -> Self {
+        HgIndexError::StringError(error.to_string())
+    }
+}
+
+impl From<Box<bincode::ErrorKind>> for HgIndexError {
+    fn from(error: Box<bincode::ErrorKind>) -> Self {
+        HgIndexError::BincodeError(error.to_string())
+    }
+}
+
+#[cfg(feature = "cli")]
+impl From<glob::GlobError> for HgIndexError {
+    fn from(error: glob::GlobError) -> Self {
+        HgIndexError::StringError(format!("Glob error: {}", error))
     }
 }

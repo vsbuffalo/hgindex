@@ -13,3 +13,5 @@ mkdir -p "${SCRIPT_DIR}/../tests/data"
 "${SCRIPT_DIR}/duckdb/duckdb" < "${SCRIPT_DIR}/download_refgene.sql"
 
 echo -e "${GREEN}RefGene data downloaded successfully${NC}"
+
+

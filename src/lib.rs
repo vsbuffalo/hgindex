@@ -27,3 +27,6 @@ pub trait GenomicCoordinates {
     /// Get the end coordinate (0-based, exclusive)
     fn end(&self) -> u32;
 }
+
+pub trait Metadata: Serialize + for<'de> Deserialize<'de> + std::fmt::Debug {}
+impl<T> Metadata for T where T: Serialize + for<'de> Deserialize<'de> + std::fmt::Debug {}

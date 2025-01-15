@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = []
-cli = ["dep:clap", "dep:csv", "dep:indicatif", "dep:flate2"]
+cli = ["dep:clap", "dep:csv", "dep:indicatif", "dep:flate2", "dep:glob"]
 dev = ["cli", "dep:rand"]
 
 [dependencies]
@@ -24,6 +24,10 @@ flate2 = { version = "1.0.35", optional = true }
 memmap2 = "0.9.5"
 rustc-hash = "2.1.0"
 num_cpus = "1.16.0"
+dashmap = "6.1.0"
+rayon = "1.10.0"
+parking_lot = "0.12.3"
+glob = { version = "0.3.2", optional = true}
 
 
 [dev-dependencies]

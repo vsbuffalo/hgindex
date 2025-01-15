@@ -1,48 +1,100 @@
 // binning_index.rs
 
+use std::collections::HashMap;
 use std::{fs::File, io::BufWriter, path::Path};
 
 use super::binning::{BinningSchema, HierarchicalBins};
+use crate::Metadata;
 use crate::{error::HgIndexError, SerdeType};
+use dashmap::DashMap;
+use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// State of chromosome reading / buffer for use as
+/// DashMap value.
+#[derive(Debug, Default)]
+pub struct ChromState {
+    buffer: Mutex<Vec<u64>>,
+    last_start: Option<u32>,
+}
+
+impl ChromState {
+    pub fn check_sorted(&self, start: u32, chrom: &str) -> Result<(), HgIndexError> {
+        if let Some(last_start) = self.last_start {
+            if last_start > start {
+                return Err(HgIndexError::UnsortedFeatures {
+                    chrom: chrom.to_string(),
+                    bin_id: 0,
+                    previous: last_start,
+                    current: start,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn update_position(&mut self, start: u32) {
+        self.last_start = Some(start);
+    }
+
+    pub fn clear_buffer(&self) {
+        self.buffer.lock().clear();
+    }
+
+    pub fn get_buffer(&self) -> parking_lot::MutexGuard<'_, Vec<u64>> {
+        self.buffer.lock()
+    }
+}
 
 /// BinningIndex is the sequence-level (e.g. chromosome) container
 /// for SequenceIndex objects that index the features.
-#[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct BinningIndex<M>
-where
-    M: SerdeType + std::fmt::Debug,
-{
+#[derive(Debug)]
+pub struct BinningIndex {
     pub schema: BinningSchema,
-    pub sequences: FxHashMap<String, SequenceIndex>,
-    pub metadata: Option<M>,
+    pub sequences: DashMap<String, SequenceIndex>,
     pub use_linear_index: bool,
-    last_chrom: Option<String>,
-    last_start: Option<u32>,
-    overlap_buffer: Vec<u64>,
+}
+
+impl Serialize for BinningIndex {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("BinningIndex", 6)?;
+
+        let items = self.sequences.iter();
+        let map: HashMap<String, SequenceIndex> =
+            HashMap::from_iter(items.map(|r| (r.key().clone(), r.value().clone())));
+
+        state.serialize_field("schema", &self.schema)?;
+        state.serialize_field("sequences", &map)?;
+        state.serialize_field("use_linear_index", &self.use_linear_index)?;
+
+        state.end()
+    }
 }
 
 // Implement Deserialize manually to handle the lifetime bounds correctly
-impl<'de, M> Deserialize<'de> for BinningIndex<M>
-where
-    M: SerdeType + std::fmt::Debug,
-{
+impl<'de> Deserialize<'de> for BinningIndex {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let (schema, sequences, metadata, use_linear_index, last_chrom, last_start) =
-            serde::Deserialize::deserialize(deserializer)?;
+        let (schema, sequences, use_linear_index): (
+            BinningSchema,
+            FxHashMap<String, SequenceIndex>, // Use FxHashMap for deserialization
+            bool,
+        ) = serde::Deserialize::deserialize(deserializer)?;
+
+        // Convert FxHashMap to DashMap
+        let sequences: DashMap<String, SequenceIndex> = sequences.into_iter().collect();
 
         Ok(BinningIndex {
             schema,
             sequences,
-            metadata,
             use_linear_index,
-            last_chrom,
-            last_start,
-            overlap_buffer: Vec::with_capacity(1000),
         })
     }
 }
@@ -50,12 +102,25 @@ where
 /// SequenceIndex stores the bin indices to the features they
 /// contain fully.
 ///
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SequenceIndex {
     // Map from bin ID to u64, which can be used as a VirtualOffset.
     pub bins: FxHashMap<u32, Vec<Feature>>,
-    // Linear index for quick region queries
+    // Linear index for quick region queries.
     pub linear_index: Vec<u64>,
+    // Chromosome-specific state.
+    #[serde(skip)]
+    pub chrom_state: ChromState,
+}
+
+impl Clone for SequenceIndex {
+    fn clone(&self) -> Self {
+        Self {
+            bins: self.bins.clone(),
+            linear_index: self.linear_index.clone(),
+            chrom_state: ChromState::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -68,40 +133,26 @@ pub struct Feature {
     index: u64,
 }
 
-impl<M> Default for BinningIndex<M>
-where
-    M: SerdeType + std::fmt::Debug,
-{
+impl Default for BinningIndex {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<M> BinningIndex<M>
-where
-    M: SerdeType + std::fmt::Debug,
-{
+impl BinningIndex {
     pub fn new() -> Self {
         BinningIndex {
             schema: BinningSchema::default(),
-            sequences: FxHashMap::default(),
-            metadata: None,
+            sequences: DashMap::default(),
             use_linear_index: true,
-            last_chrom: None,
-            last_start: None,
-            overlap_buffer: Vec::with_capacity(1000),
         }
     }
 
     pub fn from_schema(schema: &BinningSchema) -> Self {
         BinningIndex {
             schema: schema.clone(),
-            sequences: FxHashMap::default(),
-            metadata: None,
+            sequences: DashMap::default(),
             use_linear_index: true,
-            last_chrom: None,
-            last_start: None,
-            overlap_buffer: Vec::with_capacity(1000),
         }
     }
 
@@ -120,106 +171,90 @@ where
         Ok(bincode::deserialize(&mmap[..])?)
     }
 
-    /// Set the metadata
-    pub fn set_metadata(&mut self, metadata: M) {
-        self.metadata = Some(metadata);
+    pub fn get_chrom_state(
+        &self,
+        chrom: &str,
+    ) -> Option<dashmap::mapref::one::Ref<'_, String, SequenceIndex>> {
+        self.sequences.get(chrom)
     }
 
-    /// Add a feature, a range with a file
+    pub fn check_sorted(&self, chrom: &str, start: u32) -> Result<(), HgIndexError> {
+        if let Some(sequence_index) = self.sequences.get(chrom) {
+            sequence_index.chrom_state.check_sorted(start, chrom)?;
+        }
+        Ok(())
+    }
+
+    pub fn update_position_state(&self, chrom: &str, start: u32) {
+        if let Some(mut sequence_index) = self.sequences.get_mut(chrom) {
+            sequence_index.chrom_state.update_position(start);
+        }
+    }
+
+    pub fn clear_chrom_buffer(&self, chrom: &str) {
+        if let Some(sequence_index) = self.sequences.get_mut(chrom) {
+            sequence_index.chrom_state.clear_buffer();
+        }
+    }
+
+    /// Add a feature to the index at the `BinningIndex` level.
     pub fn add_feature(
-        &mut self,
+        &self,
         chrom: &str,
         start: u32,
         end: u32,
         index: u64,
     ) -> Result<(), HgIndexError> {
-        // Check sorting - compare chrom first, then start, then end
-        if let (Some(last_chrom), Some(last_start)) = (&self.last_chrom, self.last_start) {
-            if last_chrom == chrom && last_start > start {
-                // check start position is not decreasing
-                return Err(HgIndexError::UnsortedFeatures {
-                    chrom: chrom.to_string(),
-                    bin_id: 0,
-                    previous: last_start,
-                    current: start,
-                });
-            }
-        }
+        // Get or insert the `SequenceIndex` for the chromosome.
+        let mut sequence_index = self
+            .sequences
+            .entry(chrom.to_string())
+            .or_insert_with(SequenceIndex::new);
 
-        // Update tracking
-        self.last_chrom = Some(chrom.to_string());
-        self.last_start = Some(start);
-
-        let binning = HierarchicalBins::default();
-        let bin_id = binning.region_to_bin(start, end);
-
-        // the chromosome-level index
-        let bin_index = self.sequences.entry(chrom.to_string()).or_default();
-
-        // make the feature
-        let feature = Feature { start, end, index };
-
-        // insert the feature
-        bin_index.bins.entry(bin_id).or_default().push(feature);
-
-        // Update linear index
-        let linear_idx = start >> binning.linear_shift;
-        if linear_idx >= bin_index.linear_index.len() as u32 {
-            bin_index
-                .linear_index
-                .resize(linear_idx as usize + 1, u64::MAX);
-        }
-        bin_index.linear_index[linear_idx as usize] =
-            bin_index.linear_index[linear_idx as usize].min(index);
-        Ok(())
+        // Add the feature to the `SequenceIndex`.
+        let schema = &self.schema;
+        sequence_index.add_feature(start, end, index, schema)
     }
 
-    /// Return the indices (e.g. file offsets) of all ranges that overlap with the supplied range.
-    pub fn find_overlapping(&mut self, chrom: &str, start: u32, end: u32) -> &[u64] {
-        // First, clear the shared buffer
-        self.overlap_buffer.clear();
-
-        let Some(chrom_index) = self.sequences.get(chrom) else {
-            return &self.overlap_buffer;
-        };
-
-        let binning = HierarchicalBins::default();
-        let bins_to_check = binning.region_to_bins(start, end);
-
-        // Use linear index to find minimum file offset to start checking
-        let min_offset = {
-            let linear_idx = start >> binning.linear_shift;
-            let max_linear_idx = chrom_index.linear_index.len();
-            if linear_idx < max_linear_idx as u32 {
-                chrom_index.linear_index[linear_idx as usize]
-            } else {
-                // If we're beyond the end of the linear index, there can't be any features
-                // that overlap this region, so return an empty vector
-                return &self.overlap_buffer;
-            }
-        };
-
-        let overlapping = &mut self.overlap_buffer;
-        for bin_id in bins_to_check {
-            if let Some(features) = chrom_index.bins.get(&bin_id) {
-                for feature in features {
-                    // Stop if we've gone past possible overlaps, since features is sorted.
-                    if feature.start >= end {
-                        break; // No more features in this bin can overlap
-                    }
-
-                    // Check for actual overlaps at the index-level.
-                    // This differs a bit from tabix + bgzip, which ranges
-                    // with virtual offsets, and has to decompress and compare everything in
-                    // a block overlapping that virtual offset range.
-                    if feature.index >= min_offset && feature.start < end && feature.end > start {
-                        overlapping.push(feature.index);
-                    }
-                }
-            }
+    // Helper method: Compute the minimum offset from the linear index
+    fn get_min_offset<'a>(
+        &self,
+        sequence_index: &SequenceIndex,
+        start: u32,
+        binning: &HierarchicalBins,
+    ) -> u64 {
+        let linear_idx = start >> binning.linear_shift;
+        if linear_idx >= sequence_index.linear_index.len() as u32 {
+            return u64::MAX;
         }
+        sequence_index.linear_index[linear_idx as usize]
+    }
 
-        overlapping
+    /// Return an iterator over the indices (e.g. file offsets) of all ranges that overlap with the supplied range.
+    pub fn find_overlapping<'a>(
+        &'a self,
+        chrom: &str,
+        start: u32,
+        end: u32,
+    ) -> Box<dyn Iterator<Item = u64> + 'a> {
+        if let Some(sequence_index) = self.sequences.get(chrom) {
+            let binning = HierarchicalBins::from_schema(&self.schema);
+            let bins_to_check = binning.region_to_bins(start, end);
+
+            let iter = bins_to_check
+                .into_iter()
+                .filter_map(move |bin_id| sequence_index.bins.get(&bin_id).cloned())
+                .flat_map(move |features| {
+                    features
+                        .into_iter()
+                        .filter(move |feature| feature.start < end && feature.end > start)
+                        .map(|feature| feature.index)
+                });
+
+            Box::new(iter)
+        } else {
+            Box::new(std::iter::empty())
+        }
     }
 
     /// Return the range of offsets that could contain an overlapping range.
@@ -271,10 +306,74 @@ where
     }
 
     /// Write the BinningIndex to a path by binary serialization.
-    pub fn write(&mut self, path: &Path) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // TODO write metdata
+    pub fn serialize_to_path<M>(
+        &self,
+        path: &Path,
+        metadata: Option<&M>,
+    ) -> Result<(), HgIndexError>
+    where
+        M: Metadata,
+    {
         let mut file = BufWriter::new(File::create(path)?);
-        bincode::serialize_into(&mut file, &self)?;
+
+        let index_store = BinningIndexStore::new(&self, metadata);
+        bincode::serialize_into(&mut file, &index_store)?;
         Ok(())
+    }
+}
+
+/// A store-variant of SequenceIndex (with metadata)
+#[derive(Debug, Serialize)]
+pub struct BinningIndexStore<'a, M>
+where
+    M: Metadata,
+{
+    pub store: &'a BinningIndex,
+    pub metadata: Option<&'a M>,
+}
+
+impl<'a, M> BinningIndexStore<'a, M>
+where
+    M: SerdeType + std::fmt::Debug,
+{
+    pub fn new(store: &'a BinningIndex, metadata: Option<&'a M>) -> Self {
+        BinningIndexStore { store, metadata }
+    }
+}
+
+impl<'de, M> Deserialize<'de> for BinningIndexStore<'de, M>
+where
+    M: Metadata,
+    for<'a> &'a M: Metadata,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct BinningIndexStoreData<M> {
+            schema: BinningSchema,
+            sequences: FxHashMap<String, SequenceIndex>,
+            use_linear_index: bool,
+            metadata: M,
+        }
+
+        let data = BinningIndexStoreData::deserialize(deserializer)?;
+
+        // Reconstruct DashMap from the deserialized FxHashMap
+        let sequences: DashMap<String, SequenceIndex> = data.sequences.into_iter().collect();
+
+        let store = BinningIndex {
+            schema: data.schema,
+            sequences,
+            use_linear_index: data.use_linear_index,
+        };
+
+        Ok(BinningIndexStore {
+            store: Box::leak(Box::new(store)), // Lifetime adjustment
+            metadata: *Box::leak(Box::new(data.metadata)), // Lifetime adjustment
+        })
     }
 }
 
@@ -289,7 +388,42 @@ impl SequenceIndex {
         SequenceIndex {
             bins: FxHashMap::default(),
             linear_index: Vec::new(),
+            chrom_state: ChromState::default(),
         }
+    }
+
+    /// Add a feature to the index
+    // DEVNOTE: this was initially at the BinningIndex level,
+    // but this method created a headache at that level. Moving
+    // it down to SequenceIndex solved this.
+    pub fn add_feature(
+        &mut self,
+        start: u32,
+        end: u32,
+        index: u64,
+        schema: &BinningSchema,
+    ) -> Result<(), HgIndexError> {
+        // Check sorting
+        self.chrom_state.check_sorted(start, "chrom")?;
+
+        // Update tracking
+        self.chrom_state.update_position(start);
+
+        let binning = HierarchicalBins::from_schema(schema);
+        let bin_id = binning.region_to_bin(start, end);
+
+        // Add the feature
+        let feature = Feature { start, end, index };
+        self.bins.entry(bin_id).or_default().push(feature);
+
+        // Update the linear index
+        let linear_idx = start >> binning.linear_shift;
+        if linear_idx >= self.linear_index.len() as u32 {
+            self.linear_index.resize(linear_idx as usize + 1, u64::MAX);
+        }
+        self.linear_index[linear_idx as usize] = self.linear_index[linear_idx as usize].min(index);
+
+        Ok(())
     }
 }
 
@@ -297,8 +431,8 @@ impl SequenceIndex {
 mod tests {
     use super::*;
 
-    fn make_test_index() -> BinningIndex<()> {
-        let mut index = BinningIndex::new();
+    fn make_test_index() -> BinningIndex {
+        let index = BinningIndex::default();
 
         // Add features with the indices
         index.add_feature("chr1", 1000, 2000, 100).unwrap();
@@ -328,7 +462,7 @@ mod tests {
 
     #[test]
     fn test_linear_index() {
-        let mut index = BinningIndex::<()>::new();
+        let index = BinningIndex::new();
 
         // Add features with increasing offsets in bin-sized chunks
         for i in 0..10u32 {
@@ -348,7 +482,7 @@ mod tests {
 
     #[test]
     fn test_bin_boundaries() {
-        let mut index = BinningIndex::<()>::new();
+        let index = BinningIndex::new();
 
         // Add features at bin boundaries
         index.add_feature("chr1", 0, 16384, 100).unwrap(); // Exactly one level 1 bin
@@ -362,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_feature_ordering() {
-        let mut index = BinningIndex::<()>::new();
+        let index = BinningIndex::new();
 
         // Test basic ordering works
         assert!(index.add_feature("chr1", 1000, 2000, 100).is_ok());
@@ -377,7 +511,7 @@ mod tests {
         assert!(index.add_feature("chr3", 1000, 2000, 600).is_ok());
 
         // Test errors
-        let mut index = BinningIndex::<()>::new();
+        let index = BinningIndex::new();
 
         // Setup initial feature
         assert!(index.add_feature("chr1", 2000, 3000, 100).is_ok());
@@ -396,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_feature_ordering_with_ties() {
-        let mut index = BinningIndex::<()>::new();
+        let index = BinningIndex::new();
 
         // Test ties are okay
         assert!(index.add_feature("chr1", 1000, 2000, 100).is_ok());

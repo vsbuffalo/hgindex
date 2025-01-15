@@ -57,11 +57,14 @@ pub fn run(args: QueryArgs) -> Result<(), HgIndexError> {
 
     // Verify the input path exists
     if !input_path.exists() {
-        return Err(format!("Input file {} does not exist.", input_path.display()).into());
+        return Err(HgIndexError::StringError(format!(
+            "Input file {} does not exist.",
+            input_path.display()
+        )));
     }
 
     // Open store once for all queries
-    let mut store = GenomicDataStore::<BedRecord, ()>::open(&input_path, None)?;
+    let mut store = GenomicDataStore::<BedRecord>::open(&input_path, None)?;
 
     if let Some(region) = args.region {
         // Single region query
@@ -83,7 +86,7 @@ pub fn run(args: QueryArgs) -> Result<(), HgIndexError> {
 }
 
 fn query_single_region<W: std::io::Write>(
-    store: &mut GenomicDataStore<BedRecord, ()>,
+    store: &mut GenomicDataStore<BedRecord>,
     region: &str,
     output_writer: &mut W,
 ) -> Result<(), HgIndexError> {
@@ -112,7 +115,7 @@ fn query_single_region<W: std::io::Write>(
 }
 
 fn query_bed_regions<W: std::io::Write>(
-    store: &mut GenomicDataStore<BedRecord, ()>,
+    store: &mut GenomicDataStore<BedRecord>,
     regions_file: &PathBuf,
     output_writer: &mut W,
 ) -> Result<(), HgIndexError> {

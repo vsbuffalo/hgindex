@@ -1,16 +1,20 @@
+use dashmap::DashMap;
 use std::io;
+use std::io::Write as IoWrite;
+use std::sync::Arc;
 use std::{
-    collections::HashMap,
     fs::{self, File},
-    io::{BufWriter, Seek, Write},
+    io::{BufWriter, Seek},
     marker::PhantomData,
     path::{Path, PathBuf},
 };
 
+use rayon::prelude::*;
+
 use memmap2::Mmap;
 
-use crate::GenomicCoordinates;
 use crate::{error::HgIndexError, index::BinningIndex, BinningSchema, SerdeType};
+use crate::{GenomicCoordinates, Metadata};
 
 #[derive(Debug)]
 enum FileHandle {
@@ -19,20 +23,21 @@ enum FileHandle {
 }
 
 #[derive(Debug)]
-pub struct GenomicDataStore<T, M>
+pub struct GenomicDataStore<T>
 where
-    T: GenomicCoordinates + SerdeType,
-    M: SerdeType + std::fmt::Debug,
+    T: GenomicCoordinates + SerdeType + Send + Sync,
 {
-    index: BinningIndex<M>,
-    data_files: HashMap<String, FileHandle>,
+    index: Arc<BinningIndex>,
+    data_files: Arc<DashMap<String, FileHandle>>,
     directory: PathBuf,
     key: Option<String>,
-    results_buffer: Vec<T>,
     _phantom: PhantomData<T>,
 }
 
-impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicDataStore<T, M> {
+impl<T> GenomicDataStore<T>
+where
+    T: GenomicCoordinates + SerdeType + Send + Sync,
+{
     const MAGIC: [u8; 4] = *b"GIDX";
     const INDEX_FILENAME: &'static str = "index.bin";
 
@@ -58,16 +63,18 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
             fs::create_dir_all(directory.join(key))?;
         }
         Ok(Self {
-            index: BinningIndex::from_schema(schema),
-            data_files: HashMap::new(),
+            index: Arc::new(BinningIndex::from_schema(schema)),
+            data_files: Arc::new(DashMap::new()),
             directory: directory.to_path_buf(),
             key,
-            results_buffer: Vec::with_capacity(1000),
             _phantom: PhantomData,
         })
     }
 
-    fn get_or_create_file(&mut self, chrom: &str) -> std::io::Result<&mut File> {
+    fn get_or_create_file(
+        &self,
+        chrom: &str,
+    ) -> io::Result<dashmap::mapref::one::RefMut<'_, String, FileHandle>> {
         if !self.data_files.contains_key(chrom) {
             let data_path = self.get_data_path(chrom);
             let file = File::create(&data_path)?;
@@ -79,8 +86,13 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
                 .insert(chrom.to_string(), FileHandle::Write(file));
         }
 
-        match self.data_files.get_mut(chrom).unwrap() {
-            FileHandle::Write(file) => Ok(file),
+        let file_ref = self
+            .data_files
+            .get_mut(chrom)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to get file handle"))?;
+
+        match &*file_ref {
+            FileHandle::Write(_) => Ok(file_ref),
             FileHandle::Read(_) => Err(io::Error::new(
                 io::ErrorKind::Other,
                 "File is open for reading",
@@ -88,122 +100,218 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
         }
     }
 
-    // Add these methods to your existing impl block
-    pub fn metadata(&self) -> Option<&M> {
-        self.index.metadata.as_ref()
-    }
+    pub fn add_record(&self, chrom: &str, record: &T) -> Result<(), HgIndexError> {
+        let file_ref = self.get_or_create_file(chrom)?;
 
-    /// Get a mutable reference to the store's metadata
-    pub fn metadata_mut(&mut self) -> Option<&mut M> {
-        self.index.metadata.as_mut()
-    }
+        let offset = match &*file_ref {
+            FileHandle::Write(file) => {
+                let mut writer = BufWriter::new(file);
+                let offset = writer.stream_position()?;
+                let record_data = bincode::serialize(record).unwrap();
+                let length = record_data.len() as u64;
+                writer.write_all(&length.to_le_bytes())?;
+                writer.write_all(&record_data)?;
+                writer.flush()?;
+                offset
+            }
+            _ => {
+                return Err(HgIndexError::StringError(
+                    "File not opened for writing".into(),
+                ))
+            }
+        };
 
-    /// Set the store's metadata
-    pub fn set_metadata(&mut self, metadata: M) {
-        self.index.metadata = Some(metadata);
-    }
-
-    /// Take ownership of the metadata, leaving None in its place
-    pub fn take_metadata(&mut self) -> Option<M> {
-        self.index.metadata.take()
-    }
-
-    pub fn add_record(&mut self, chrom: &str, record: &T) -> Result<(), HgIndexError> {
-        // If this is a new chromosome and we already have some files open,
-        // close the previous chromosome's file
-        if !self.data_files.contains_key(chrom) {
-            // Keep only this chromosome's file open
-            self.data_files.retain(|k, _| k == chrom);
-        }
-
-        let file = self.get_or_create_file(chrom)?;
-
-        // Create a scope to ensure writer is dropped before we use self.index
-        let offset = {
-            let mut writer = BufWriter::new(file);
-            let offset = writer.stream_position()?;
-
-            // Serialize record and get its length
-            let record_data = bincode::serialize(record).unwrap();
-            let length = record_data.len() as u64;
-
-            // Write length followed by record
-            writer.write_all(&length.to_le_bytes())?;
-            writer.write_all(&record_data)?;
-            writer.flush()?;
-
-            offset
-        }; // writer is dropped here, releasing the borrow
-
-        // Add the feature to the index now.
-        let start = record.start();
-        let end = record.end();
-        self.index.add_feature(chrom, start, end, offset)?;
-
+        // Add feature directly to the chromosome-level index
+        self.index
+            .add_feature(chrom, record.start(), record.end(), offset)?;
         Ok(())
     }
 
-    // Add a method to explicitly close files
-    fn close_files(&mut self) -> io::Result<()> {
-        self.data_files.clear();
-        Ok(())
-    }
-
-    pub fn finalize(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        self.close_files()?;
-
-        // Write index to file
-        let index_path = if let Some(ref key) = self.key {
+    /// Get the current index path
+    pub fn index_path(&self) -> PathBuf {
+        if let Some(ref key) = self.key {
             self.directory.join(key).join(Self::INDEX_FILENAME)
         } else {
             self.directory.join(Self::INDEX_FILENAME)
-        };
+        }
+    }
 
-        self.index.write(index_path.as_path())?;
+    pub fn finalize(&self) -> Result<(), HgIndexError> {
+        // Clear all file handles before finalizing
+        self.data_files.clear();
+
+        // Get the current index and serialize it with the provided metadata
+        let index_path = self.index_path();
+        self.index.serialize_to_path(&index_path, None::<&()>)?;
         Ok(())
     }
 
-    pub fn open(
-        directory: &Path,
-        key: Option<String>,
-    ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+    pub fn finalize_with_metadata<M>(&self, metadata: &M) -> Result<(), Box<dyn std::error::Error>>
+    where
+        M: Metadata,
+    {
+        // Clear all file handles before finalizing
+        self.data_files.clear();
+
+        // Get the current index and serialize it with the provided metadata
+        let index_path = self.index_path();
+        self.index.serialize_to_path(&index_path, Some(metadata))?;
+
+        Ok(())
+    }
+
+    pub fn open(directory: &Path, key: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
         let target_dir = if let Some(ref key) = key {
             directory.join(key)
         } else {
             directory.to_path_buf()
         };
 
-        // Read index file
         let index_path = target_dir.join(Self::INDEX_FILENAME);
         let index = BinningIndex::open(&index_path)?;
 
-        // Initialize without opening any chromosome files yet
         Ok(Self {
-            index,
-            data_files: HashMap::new(),
+            index: Arc::new(index),
+            data_files: Arc::new(DashMap::new()),
             directory: directory.to_path_buf(),
             key,
-            results_buffer: Vec::with_capacity(1000),
             _phantom: PhantomData,
         })
     }
 
-    pub fn open_chrom_file(&mut self, chrom: &str) -> std::io::Result<()> {
+    fn open_chrom_file(&self, chrom: &str) -> io::Result<()> {
         if !self.data_files.contains_key(chrom) {
             let data_path = self.get_data_path(chrom);
             let file = File::open(&data_path)?;
             let mmap = unsafe { Mmap::map(&file)? };
 
             if mmap[0..4] != Self::MAGIC {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
                     "Invalid file format",
                 ));
             }
+
             self.data_files
                 .insert(chrom.to_string(), FileHandle::Read(mmap));
         }
         Ok(())
+    }
+
+    fn get_mmap_for_chrom(
+        &self,
+        chrom: &str,
+    ) -> Result<dashmap::mapref::one::Ref<'_, String, FileHandle>, HgIndexError> {
+        self.open_chrom_file(chrom)?;
+
+        let guard = self
+            .data_files
+            .get(chrom)
+            .ok_or_else(|| HgIndexError::StringError("Chromosome not found".into()))?;
+
+        match &*guard {
+            FileHandle::Read(_) => Ok(guard),
+            _ => Err(HgIndexError::StringError("File is open for writing".into())),
+        }
+    }
+
+    /// Alias
+    pub fn get_overlapping(
+        &self,
+        chrom: &str,
+        start: u32,
+        end: u32,
+    ) -> Result<Vec<T>, HgIndexError> {
+        self.get_overlapping_batch(chrom, start, end)
+    }
+
+    pub fn get_overlapping_batch(
+        &self,
+        chrom: &str,
+        start: u32,
+        end: u32,
+    ) -> Result<Vec<T>, HgIndexError> {
+        // Validate the input interval
+        if end <= start {
+            return Err(HgIndexError::InvalidInterval { start, end });
+        }
+
+        // Clone the index for thread safety
+        let index = self.index.clone();
+
+        // Check if the chromosome exists in the index
+        if !index.sequences.contains_key(chrom) {
+            return Ok(Vec::new());
+        }
+
+        // Get the memory map for the specified chromosome
+        let mmap_ref = self.get_mmap_for_chrom(chrom)?;
+        let mmap = match &*mmap_ref {
+            FileHandle::Read(mmap) => mmap,
+            _ => return Err(HgIndexError::StringError("File is open for writing".into())),
+        };
+
+        // Find the offsets for the overlapping regions
+        let offsets: Vec<u64> = index.find_overlapping(chrom, start, end).collect();
+        if offsets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Get the first and last offsets
+        let first_offset = offsets[0] as usize;
+        let last_offset = *offsets.last().unwrap() as usize;
+
+        // Determine the length of the last record
+        if last_offset + 8 > mmap.len() {
+            return Err(HgIndexError::StringError("Invalid offset bounds".into()));
+        }
+        let last_length =
+            u64::from_le_bytes(mmap[last_offset..last_offset + 8].try_into().map_err(|_| {
+                HgIndexError::StringError("Failed to parse length of the last record".into())
+            })?) as usize;
+
+        // Define the end boundary of the region to process
+        let region_end = last_offset + 8 + last_length;
+
+        // Collect the results
+        let mut results = Vec::with_capacity(offsets.len());
+        let mut current_offset = first_offset;
+
+        while current_offset < region_end {
+            // Ensure we stay within the bounds of the memory map
+            if current_offset + 8 > mmap.len() {
+                break;
+            }
+
+            // Get the length of the current record
+            let length = u64::from_le_bytes(
+                mmap[current_offset..current_offset + 8]
+                    .try_into()
+                    .map_err(|_| {
+                        HgIndexError::StringError("Failed to parse record length".into())
+                    })?,
+            ) as usize;
+
+            // Ensure the full record fits within the memory map
+            if current_offset + 8 + length > mmap.len() {
+                break;
+            }
+
+            // Check if the current offset is in the list of offsets
+            if offsets.contains(&(current_offset as u64)) {
+                // Deserialize the record and add it to the results
+                if let Ok(record) = bincode::deserialize::<T>(
+                    &mmap[current_offset + 8..current_offset + 8 + length],
+                ) {
+                    results.push(record);
+                }
+            }
+
+            // Move to the next record
+            current_offset += 8 + length;
+        }
+
+        Ok(results)
     }
 
     pub fn map_overlapping_batch<F>(
@@ -214,208 +322,91 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
         mut fun: F,
     ) -> Result<usize, HgIndexError>
     where
-        F: FnMut(&[u8]) -> Result<(), HgIndexError>, // Takes raw bytes instead of deserialized record
+        F: FnMut(&[u8]) -> Result<(), HgIndexError>,
     {
-        // First, clear the shared buffer
-        self.results_buffer.clear();
-
+        // Validate interval
         if end <= start {
             return Err(HgIndexError::InvalidInterval { start, end });
         }
 
+        // Early exit if chromosome not found
         if !self.index.sequences.contains_key(chrom) {
             return Ok(0);
         }
 
-        if self.open_chrom_file(chrom).is_err() {
-            return Ok(0);
-        }
-
-        let mmap = match self.data_files.get(chrom).unwrap() {
+        // Open and validate the mmap
+        self.open_chrom_file(chrom)?;
+        let file_ref = self.data_files.get(chrom).unwrap();
+        let mmap = match &*file_ref {
+            // Deref the DashMap::Ref here
             FileHandle::Read(mmap) => mmap,
             FileHandle::Write(_) => {
                 return Err(HgIndexError::StringError("File is open for writing".into()))
             }
         };
 
-        let offsets = self.index.find_overlapping(chrom, start, end);
+        // Get overlapping offsets and collect them since we can't check is_empty on iterator
+        let offsets: Vec<u64> = self.index.find_overlapping(chrom, start, end).collect();
         if offsets.is_empty() {
             return Ok(0);
         }
 
-        // Get range for batch processing
-        let first_offset = offsets[0] as usize;
-        let last_offset = offsets[offsets.len() - 1] as usize;
-
-        // Read length at last position to know total range
-        let last_length =
-            u64::from_le_bytes(mmap[last_offset..last_offset + 8].try_into().unwrap()) as usize;
-
-        let region_end = last_offset + 8 + last_length;
-
-        // Pre-allocate results
-        self.results_buffer.reserve(offsets.len());
-
-        // Process records in range
         let mut count = 0;
-        // Process records in range
-        let mut current_offset = first_offset;
-        while current_offset < region_end {
-            if current_offset + 8 > mmap.len() {
-                break;
+        for offset in offsets {
+            let offset = offset as usize;
+            if offset + 8 > mmap.len() {
+                continue;
             }
+
+            // Get record length
             let length =
-                u64::from_le_bytes(mmap[current_offset..current_offset + 8].try_into().unwrap())
-                    as usize;
+                u64::from_le_bytes(mmap[offset..offset + 8].try_into().map_err(|_| {
+                    HgIndexError::StringError("Failed to parse record length".into())
+                })?) as usize;
 
-            if current_offset + 8 + length > mmap.len() {
-                break;
+            if offset + 8 + length > mmap.len() {
+                continue;
             }
 
-            // Only process if this offset is in our overlaps list
-            if offsets.binary_search(&(current_offset as u64)).is_ok() {
-                // Pass raw bytes to function instead of deserializing
-                fun(&mmap[current_offset + 8..current_offset + 8 + length])?;
-                count += 1;
-            }
-            current_offset += 8 + length;
+            // Process record bytes with provided function
+            fun(&mmap[offset + 8..offset + 8 + length])?;
+            count += 1;
         }
 
         Ok(count)
     }
 
-    /// Batch-based get_overlapping()
-    pub fn get_overlapping_batch(
-        &mut self,
-        chrom: &str,
-        start: u32,
-        end: u32,
-    ) -> Result<&[T], HgIndexError> {
-        // First, clear the shared buffer
+    pub fn map_overlapping_parallel<F>(
+        &self,
+        regions: Vec<(String, u32, u32)>,
+        fun: F,
+    ) -> Result<Vec<usize>, HgIndexError>
+    where
+        F: Fn(&[u8]) -> Result<(), HgIndexError> + Sync,
+    {
+        // Parallel processing of regions
+        let results: Result<Vec<usize>, HgIndexError> = regions
+            .into_par_iter()
+            .map(|(chrom, start, end)| {
+                // For each region, process overlaps with `fun`
+                self.map_overlapping_batch(&chrom, start, end, fun.clone())
+            })
+            .collect();
 
-        self.results_buffer.clear();
-        if end <= start {
-            return Err(HgIndexError::InvalidInterval { start, end });
-        }
-        if !self.index.sequences.contains_key(chrom) {
-            return Ok(&self.results_buffer);
-        }
-
-        if self.open_chrom_file(chrom).is_err() {
-            return Ok(&self.results_buffer);
-        }
-
-        let mmap = match self.data_files.get(chrom).unwrap() {
-            FileHandle::Read(mmap) => mmap,
-            FileHandle::Write(_) => {
-                return Err(HgIndexError::StringError("File is open for writing".into()))
-            }
-        };
-
-        let offsets = self.index.find_overlapping(chrom, start, end);
-        if offsets.is_empty() {
-            return Ok(&self.results_buffer);
-        }
-
-        // Get range for batch processing
-        let first_offset = offsets[0] as usize;
-        let last_offset = offsets[offsets.len() - 1] as usize;
-
-        // Read length at last position to know total range
-        let last_length =
-            u64::from_le_bytes(mmap[last_offset..last_offset + 8].try_into().unwrap()) as usize;
-        // This didn't speed things up much behind the try_into().
-        //let last_length = unsafe {
-        //    // Read 8 bytes as a u64 from the mmap slice at the given position
-        //    ptr::read_unaligned(mmap.as_ptr().add(last_offset) as *const usize)
-        //};
-
-        let region_end = last_offset + 8 + last_length;
-
-        // Pre-allocate results
-        self.results_buffer.reserve(offsets.len());
-
-        // Process records in range
-        let mut current_offset = first_offset;
-        while current_offset < region_end {
-            if current_offset + 8 > mmap.len() {
-                break;
-            }
-            let length =
-                u64::from_le_bytes(mmap[current_offset..current_offset + 8].try_into().unwrap())
-                    as usize;
-            // This didn't speed things up much behind the try_into().
-            // let length = unsafe { ptr::read_unaligned(mmap.as_ptr().add(current_offset) as *const usize) };
-
-            if current_offset + 8 + length > mmap.len() {
-                break;
-            }
-
-            // Only deserialize if this offset is in our overlaps list
-            if offsets.binary_search(&(current_offset as u64)).is_ok() {
-                if let Ok(record) =
-                    bincode::deserialize(&mmap[current_offset + 8..current_offset + 8 + length])
-                {
-                    self.results_buffer.push(record);
-                } else {
-                    panic!("Error deserializing record at {}!", current_offset + 8);
-                }
-            }
-            current_offset += 8 + length;
-        }
-
-        Ok(&self.results_buffer)
+        results
     }
 
-    /// The features overlapping the range with this start and end position.
-    pub fn get_overlapping(
-        &mut self,
-        chrom: &str,
-        start: u32,
-        end: u32,
-    ) -> Result<&[T], HgIndexError> {
-        self.results_buffer.clear();
-        if end <= start {
-            return Err(HgIndexError::InvalidInterval { start, end });
-        }
-        // Early return empty vec if chromosome not in index
-        if !self.index.sequences.contains_key(chrom) {
-            return Ok(&self.results_buffer);
-        }
+    // New method for parallel querying of multiple regions
+    pub fn get_overlapping_parallel(
+        &self,
+        regions: Vec<(String, u32, u32)>,
+    ) -> Result<Vec<Vec<T>>, HgIndexError> {
+        use rayon::prelude::*;
 
-        // Early return if chromosome not in index
-        if !self.index.sequences.contains_key(chrom) {
-            return Ok(&self.results_buffer);
-        }
-
-        // Open chromosome file if not already open
-        if self.open_chrom_file(chrom).is_err() {
-            return Ok(&self.results_buffer);
-        }
-
-        let mmap = match self.data_files.get(chrom).unwrap() {
-            FileHandle::Read(mmap) => mmap,
-            FileHandle::Write(_) => {
-                return Err(HgIndexError::StringError("File is open for writing".into()))
-            }
-        };
-
-        for offset in self.index.find_overlapping(chrom, start, end) {
-            let offset = *offset as usize;
-            if offset + 8 <= mmap.len() {
-                // Read length
-                let length =
-                    u64::from_le_bytes(mmap[offset..offset + 8].try_into().unwrap()) as usize;
-                if offset + 8 + length <= mmap.len() {
-                    let record_slice = &mmap[offset + 8..offset + 8 + length];
-                    // Read record
-                    if let Ok(record) = bincode::deserialize(record_slice) {
-                        self.results_buffer.push(record);
-                    }
-                }
-            }
-        }
-        Ok(&self.results_buffer)
+        regions
+            .into_par_iter()
+            .map(|(chrom, start, end)| self.get_overlapping_batch(&chrom, start, end))
+            .collect()
     }
 }
 
@@ -492,7 +483,7 @@ mod tests {
         let key = "example-key".to_string();
 
         // Create store and add records
-        let mut store = GenomicDataStore::<TestRecord, ()>::create(base_dir, Some(key.clone()))
+        let store = GenomicDataStore::<TestRecord>::create(base_dir, Some(key.clone()))
             .expect("Failed to create store");
         for (chrom, record) in make_test_records() {
             store
@@ -502,7 +493,7 @@ mod tests {
 
         store.finalize().expect("Failed to finalize store");
 
-        let mut store = GenomicDataStore::<TestRecord, ()>::open(&base_dir, Some(key.clone()))
+        let store = GenomicDataStore::<TestRecord>::open(&base_dir, Some(key.clone()))
             .expect("Failed to open store");
 
         // Test overlapping query
@@ -531,7 +522,7 @@ mod tests {
         file.write_all(b"BAD!").expect("Failed to write");
 
         // Attempt to open should fail
-        let result = GenomicDataStore::<TestRecord, ()>::open(&bad_file, None);
+        let result = GenomicDataStore::<TestRecord>::open(&bad_file, None);
         assert!(result.is_err());
     }
 
@@ -540,59 +531,17 @@ mod tests {
         let test_dir = TestDir::new("empty_regions").expect("Failed to create test dir");
         let store_path = test_dir.path().join("empty.gidx");
 
-        let mut store = GenomicDataStore::<TestRecord, ()>::create(&store_path, None)
+        let store = GenomicDataStore::<TestRecord>::create(&store_path, None)
             .expect("Failed to create store");
 
         store.finalize().expect("Failed to finalize store");
 
         // Query empty store
-        let mut store = GenomicDataStore::<TestRecord, ()>::open(&store_path, None)
-            .expect("Failed to open store");
+        let store =
+            GenomicDataStore::<TestRecord>::open(&store_path, None).expect("Failed to open store");
 
         let results = store.get_overlapping("chr1", 0, 1000).unwrap();
         assert_eq!(results.len(), 0);
-    }
-
-    #[test]
-    fn test_metadata_handling() {
-        let test_dir = TestDir::new("metadata").expect("Failed to create test dir");
-        let store_path = test_dir.path().join("meta.gidx");
-
-        // Create a store with initial metadata
-        let mut store = GenomicDataStore::<TestRecord, String>::create(&store_path, None)
-            .expect("Failed to create store");
-
-        // Index must be created before metadata.
-        store.finalize().unwrap();
-        store.set_metadata("initial metadata".to_string());
-
-        // Test metadata access
-        assert_eq!(store.metadata(), Some(&"initial metadata".to_string()));
-
-        // Test metadata mutation
-        if let Some(meta) = store.metadata_mut() {
-            meta.push_str(" - updated");
-        }
-        assert_eq!(
-            store.metadata(),
-            Some(&"initial metadata - updated".to_string())
-        );
-
-        // Test metadata replacement
-        store.set_metadata("new metadata".to_string());
-        assert_eq!(store.metadata(), Some(&"new metadata".to_string()));
-
-        // Test metadata removal
-        let taken = store.take_metadata();
-        assert_eq!(taken, Some("new metadata".to_string()));
-        assert_eq!(store.metadata(), None);
-
-        store.finalize().expect("Failed to finalize store");
-
-        // Test metadata persistence
-        let reopened = GenomicDataStore::<TestRecord, String>::open(&store_path, None)
-            .expect("Failed to open store");
-        assert_eq!(reopened.metadata(), None);
     }
 
     // A minimal test record
@@ -623,7 +572,7 @@ mod tests {
 
         // Create and populate store
         {
-            let mut store = GenomicDataStore::<MinimalTestRecord, ()>::create(&store_path, None)
+            let store = GenomicDataStore::<MinimalTestRecord>::create(&store_path, None)
                 .expect("Failed to create store");
 
             // Add some overlapping records
@@ -652,7 +601,7 @@ mod tests {
             .map(|i| {
                 let path = Arc::clone(&path);
                 thread::spawn(move || {
-                    let mut store = GenomicDataStore::<MinimalTestRecord, ()>::open(&path, None)
+                    let store = GenomicDataStore::<MinimalTestRecord>::open(&path, None)
                         .expect("Failed to open store");
 
                     // Each thread queries a different but overlapping region
