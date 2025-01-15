@@ -150,7 +150,7 @@ where
         self.last_chrom = Some(chrom.to_string());
         self.last_start = Some(start);
 
-        let binning = HierarchicalBins::default();
+        let binning = HierarchicalBins::from_schema(&self.schema);
         let bin_id = binning.region_to_bin(start, end);
 
         // the chromosome-level index
@@ -183,7 +183,8 @@ where
             return &self.overlap_buffer;
         };
 
-        let binning = HierarchicalBins::default();
+        let binning = HierarchicalBins::from_schema(&self.schema);
+
         let bins_to_check = binning.region_to_bins(start, end);
 
         // Use linear index to find minimum file offset to start checking
