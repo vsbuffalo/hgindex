@@ -432,6 +432,7 @@ dependencies = [
  "flate2",
  "indexmap",
  "indicatif",
+ "itoa",
  "memmap2",
  "num_cpus",
  "proptest",

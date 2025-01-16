@@ -9,8 +9,8 @@ use std::{
 
 use memmap2::Mmap;
 
-use crate::GenomicCoordinates;
-use crate::{error::HgIndexError, index::BinningIndex, BinningSchema, SerdeType};
+use crate::{error::HgIndexError, index::BinningIndex, BinningSchema};
+use crate::{Record, RecordSlice};
 
 #[derive(Debug)]
 enum FileHandle {
@@ -19,12 +19,11 @@ enum FileHandle {
 }
 
 #[derive(Debug)]
-pub struct GenomicDataStore<T, M>
+pub struct GenomicDataStore<T>
 where
-    T: GenomicCoordinates + SerdeType,
-    M: SerdeType + std::fmt::Debug,
+    T: Record,
 {
-    index: BinningIndex<M>,
+    index: BinningIndex,
     data_files: HashMap<String, FileHandle>,
     directory: PathBuf,
     key: Option<String>,
@@ -32,7 +31,7 @@ where
     _phantom: PhantomData<T>,
 }
 
-impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicDataStore<T, M> {
+impl<T: Record> GenomicDataStore<T> {
     const MAGIC: [u8; 4] = *b"GIDX";
     const INDEX_FILENAME: &'static str = "index.bin";
 
@@ -58,7 +57,7 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
             fs::create_dir_all(directory.join(key))?;
         }
         Ok(Self {
-            index: BinningIndex::from_schema(schema),
+            index: BinningIndex::new(schema),
             data_files: HashMap::new(),
             directory: directory.to_path_buf(),
             key,
@@ -88,58 +87,31 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
         }
     }
 
-    // Add these methods to your existing impl block
-    pub fn metadata(&self) -> Option<&M> {
-        self.index.metadata.as_ref()
-    }
-
-    /// Get a mutable reference to the store's metadata
-    pub fn metadata_mut(&mut self) -> Option<&mut M> {
-        self.index.metadata.as_mut()
-    }
-
-    /// Set the store's metadata
-    pub fn set_metadata(&mut self, metadata: M) {
-        self.index.metadata = Some(metadata);
-    }
-
-    /// Take ownership of the metadata, leaving None in its place
-    pub fn take_metadata(&mut self) -> Option<M> {
-        self.index.metadata.take()
-    }
-
     pub fn add_record(&mut self, chrom: &str, record: &T) -> Result<(), HgIndexError> {
-        // If this is a new chromosome and we already have some files open,
-        // close the previous chromosome's file
         if !self.data_files.contains_key(chrom) {
-            // Keep only this chromosome's file open
             self.data_files.retain(|k, _| k == chrom);
         }
 
         let file = self.get_or_create_file(chrom)?;
 
-        // Create a scope to ensure writer is dropped before we use self.index
+        let length;
         let offset = {
             let mut writer = BufWriter::new(file);
             let offset = writer.stream_position()?;
 
-            // Serialize record and get its length
-            let record_data = bincode::serialize(record).unwrap();
-            let length = record_data.len() as u64;
+            // Use Record trait instead of bincode
+            let record_data = record.to_bytes();
+            length = record_data.len() as u64;
 
-            // Write length followed by record
             writer.write_all(&length.to_le_bytes())?;
             writer.write_all(&record_data)?;
             writer.flush()?;
 
             offset
-        }; // writer is dropped here, releasing the borrow
+        };
 
-        // Add the feature to the index now.
-        let start = record.start();
-        let end = record.end();
-        self.index.add_feature(chrom, start, end, offset)?;
-
+        self.index
+            .add_feature(chrom, record.start(), record.end(), offset, length)?;
         Ok(())
     }
 
@@ -159,7 +131,7 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
             self.directory.join(Self::INDEX_FILENAME)
         };
 
-        self.index.write(index_path.as_path())?;
+        self.index.serialize_to_path(index_path.as_path())?;
         Ok(())
     }
 
@@ -188,6 +160,31 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
         })
     }
 
+    // NOTE: currently this is not faster than the version below, but
+    // it maybe in some cases — needs future benchmarking.
+    // pub fn open_chrom_file(&mut self, chrom: &str) -> std::io::Result<()> {
+    //     if !self.data_files.contains_key(chrom) {
+    //         let data_path = self.get_data_path(chrom);
+    //         let mmap = unsafe {
+    //             // Add MAP_POPULATE to preload pages
+    //             let file = File::open(&data_path)?;
+    //             let mut options = memmap2::MmapOptions::new();
+    //             let mmap_opts = options.populate();
+    //             mmap_opts.map(&file)?
+    //         };
+    //
+    //         if mmap[0..4] != Self::MAGIC {
+    //             return Err(std::io::Error::new(
+    //                 std::io::ErrorKind::InvalidData,
+    //                 "Invalid file format",
+    //             ));
+    //         }
+    //         self.data_files
+    //             .insert(chrom.to_string(), FileHandle::Read(mmap));
+    //     }
+    //     Ok(())
+    // }
+
     pub fn open_chrom_file(&mut self, chrom: &str) -> std::io::Result<()> {
         if !self.data_files.contains_key(chrom) {
             let data_path = self.get_data_path(chrom);
@@ -206,7 +203,8 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
         Ok(())
     }
 
-    pub fn map_overlapping_batch<F>(
+    // Rename to just map_overlapping since there's no batching
+    pub fn map_overlapping<F>(
         &mut self,
         chrom: &str,
         start: u32,
@@ -214,11 +212,8 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
         mut fun: F,
     ) -> Result<usize, HgIndexError>
     where
-        F: FnMut(&[u8]) -> Result<(), HgIndexError>, // Takes raw bytes instead of deserialized record
+        F: FnMut(T::Slice<'_>) -> Result<(), HgIndexError>,
     {
-        // First, clear the shared buffer
-        self.results_buffer.clear();
-
         if end <= start {
             return Err(HgIndexError::InvalidInterval { start, end });
         }
@@ -234,7 +229,7 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
         let mmap = match self.data_files.get(chrom).unwrap() {
             FileHandle::Read(mmap) => mmap,
             FileHandle::Write(_) => {
-                return Err(HgIndexError::StringError("File is open for writing".into()))
+                return Err(HgIndexError::StringError("File is open for writing".into()));
             }
         };
 
@@ -243,131 +238,28 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
             return Ok(0);
         }
 
-        // Get range for batch processing
-        let first_offset = offsets[0] as usize;
-        let last_offset = offsets[offsets.len() - 1] as usize;
-
-        // Read length at last position to know total range
-        let last_length =
-            u64::from_le_bytes(mmap[last_offset..last_offset + 8].try_into().unwrap()) as usize;
-
-        let region_end = last_offset + 8 + last_length;
-
-        // Pre-allocate results
-        self.results_buffer.reserve(offsets.len());
-
-        // Process records in range
         let mut count = 0;
-        // Process records in range
-        let mut current_offset = first_offset;
-        while current_offset < region_end {
-            if current_offset + 8 > mmap.len() {
-                break;
-            }
-            let length =
-                u64::from_le_bytes(mmap[current_offset..current_offset + 8].try_into().unwrap())
-                    as usize;
+        for (offset, length) in offsets {
+            let offset = *offset as usize;
+            let length = *length as usize;
 
-            if current_offset + 8 + length > mmap.len() {
-                break;
+            if offset + 8 > mmap.len() {
+                continue;
             }
 
-            // Only process if this offset is in our overlaps list
-            if offsets.binary_search(&(current_offset as u64)).is_ok() {
-                // Pass raw bytes to function instead of deserializing
-                fun(&mmap[current_offset + 8..current_offset + 8 + length])?;
-                count += 1;
+            if offset + 8 + length > mmap.len() {
+                continue;
             }
-            current_offset += 8 + length;
+
+            // Use RecordSlice for zero-copy parsing
+            let record = T::Slice::from_bytes(&mmap[offset + 8..offset + 8 + length]);
+            fun(record)?;
+            count += 1;
         }
 
         Ok(count)
     }
 
-    /// Batch-based get_overlapping()
-    pub fn get_overlapping_batch(
-        &mut self,
-        chrom: &str,
-        start: u32,
-        end: u32,
-    ) -> Result<&[T], HgIndexError> {
-        // First, clear the shared buffer
-
-        self.results_buffer.clear();
-        if end <= start {
-            return Err(HgIndexError::InvalidInterval { start, end });
-        }
-        if !self.index.sequences.contains_key(chrom) {
-            return Ok(&self.results_buffer);
-        }
-
-        if self.open_chrom_file(chrom).is_err() {
-            return Ok(&self.results_buffer);
-        }
-
-        let mmap = match self.data_files.get(chrom).unwrap() {
-            FileHandle::Read(mmap) => mmap,
-            FileHandle::Write(_) => {
-                return Err(HgIndexError::StringError("File is open for writing".into()))
-            }
-        };
-
-        let offsets = self.index.find_overlapping(chrom, start, end);
-        if offsets.is_empty() {
-            return Ok(&self.results_buffer);
-        }
-
-        // Get range for batch processing
-        let first_offset = offsets[0] as usize;
-        let last_offset = offsets[offsets.len() - 1] as usize;
-
-        // Read length at last position to know total range
-        let last_length =
-            u64::from_le_bytes(mmap[last_offset..last_offset + 8].try_into().unwrap()) as usize;
-        // This didn't speed things up much behind the try_into().
-        //let last_length = unsafe {
-        //    // Read 8 bytes as a u64 from the mmap slice at the given position
-        //    ptr::read_unaligned(mmap.as_ptr().add(last_offset) as *const usize)
-        //};
-
-        let region_end = last_offset + 8 + last_length;
-
-        // Pre-allocate results
-        self.results_buffer.reserve(offsets.len());
-
-        // Process records in range
-        let mut current_offset = first_offset;
-        while current_offset < region_end {
-            if current_offset + 8 > mmap.len() {
-                break;
-            }
-            let length =
-                u64::from_le_bytes(mmap[current_offset..current_offset + 8].try_into().unwrap())
-                    as usize;
-            // This didn't speed things up much behind the try_into().
-            // let length = unsafe { ptr::read_unaligned(mmap.as_ptr().add(current_offset) as *const usize) };
-
-            if current_offset + 8 + length > mmap.len() {
-                break;
-            }
-
-            // Only deserialize if this offset is in our overlaps list
-            if offsets.binary_search(&(current_offset as u64)).is_ok() {
-                if let Ok(record) =
-                    bincode::deserialize(&mmap[current_offset + 8..current_offset + 8 + length])
-                {
-                    self.results_buffer.push(record);
-                } else {
-                    panic!("Error deserializing record at {}!", current_offset + 8);
-                }
-            }
-            current_offset += 8 + length;
-        }
-
-        Ok(&self.results_buffer)
-    }
-
-    /// The features overlapping the range with this start and end position.
     pub fn get_overlapping(
         &mut self,
         chrom: &str,
@@ -375,22 +267,69 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
         end: u32,
     ) -> Result<&[T], HgIndexError> {
         self.results_buffer.clear();
+
         if end <= start {
             return Err(HgIndexError::InvalidInterval { start, end });
         }
-        // Early return empty vec if chromosome not in index
+
         if !self.index.sequences.contains_key(chrom) {
             return Ok(&self.results_buffer);
         }
 
-        // Early return if chromosome not in index
-        if !self.index.sequences.contains_key(chrom) {
-            return Ok(&self.results_buffer);
-        }
-
-        // Open chromosome file if not already open
         if self.open_chrom_file(chrom).is_err() {
             return Ok(&self.results_buffer);
+        }
+
+        let mmap = match self.data_files.get(chrom).unwrap() {
+            FileHandle::Read(mmap) => mmap,
+            FileHandle::Write(_) => {
+                return Err(HgIndexError::StringError("File is open for writing".into()));
+            }
+        };
+
+        let offsets = self.index.find_overlapping(chrom, start, end);
+        if offsets.is_empty() {
+            return Ok(&self.results_buffer);
+        }
+
+        for (offset, length) in offsets {
+            let offset = *offset as usize;
+            let length = *length as usize;
+
+            if offset + 8 > mmap.len() {
+                continue;
+            }
+
+            if offset + 8 + length > mmap.len() {
+                continue;
+            }
+
+            // Parse as slice then convert to owned
+            let slice = T::Slice::from_bytes(&mmap[offset + 8..offset + 8 + length]);
+            self.results_buffer.push(slice.into())
+        }
+
+        Ok(&self.results_buffer)
+    }
+
+    pub fn get_overlapping_batch<'a>(
+        &'a mut self,
+        chrom: &str,
+        start: u32,
+        end: u32,
+    ) -> Result<Vec<T::Slice<'a>>, HgIndexError> {
+        let mut results = Vec::new();
+
+        if end <= start {
+            return Err(HgIndexError::InvalidInterval { start, end });
+        }
+
+        if !self.index.sequences.contains_key(chrom) {
+            return Ok(results);
+        }
+
+        if self.open_chrom_file(chrom).is_err() {
+            return Ok(results);
         }
 
         let mmap = match self.data_files.get(chrom).unwrap() {
@@ -400,22 +339,17 @@ impl<T: GenomicCoordinates + SerdeType, M: SerdeType + std::fmt::Debug> GenomicD
             }
         };
 
-        for offset in self.index.find_overlapping(chrom, start, end) {
+        // Get all overlapping records at once
+        let offsets = self.index.find_overlapping(chrom, start, end);
+        for (offset, length) in offsets {
             let offset = *offset as usize;
-            if offset + 8 <= mmap.len() {
-                // Read length
-                let length =
-                    u64::from_le_bytes(mmap[offset..offset + 8].try_into().unwrap()) as usize;
-                if offset + 8 + length <= mmap.len() {
-                    let record_slice = &mmap[offset + 8..offset + 8 + length];
-                    // Read record
-                    if let Ok(record) = bincode::deserialize(record_slice) {
-                        self.results_buffer.push(record);
-                    }
-                }
-            }
+            let length = *length as usize;
+
+            let record = T::Slice::from_bytes(&mmap[offset + 8..offset + 8 + length]);
+            results.push(record);
         }
-        Ok(&self.results_buffer)
+
+        Ok(results)
     }
 }
 
@@ -428,8 +362,10 @@ mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
 
+    // --- Test types ---
+
     // A simple test record type
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
     struct TestRecord {
         start: u32,
         end: u32,
@@ -438,13 +374,130 @@ mod tests {
         tags: Vec<String>,
     }
 
-    impl GenomicCoordinates for TestRecord {
+    // The slice variant of TestRecord
+    #[derive(Clone, Debug, Deserialize)]
+    struct TestRecordSlice<'a> {
+        start: u32,
+        end: u32,
+        name: &'a str,
+        score: f64,
+        tags: Vec<&'a str>,
+    }
+
+    // Then implement Record and RecordSlice
+    impl Record for TestRecord {
+        type Slice<'a> = TestRecordSlice<'a>;
+        fn start(&self) -> u32 {
+            self.start
+        }
+        fn end(&self) -> u32 {
+            self.end
+        }
+        fn to_bytes(&self) -> Vec<u8> {
+            // we can use bincode here for simplicity,
+            // rather than manual serialization
+            bincode::serialize(self).unwrap()
+        }
+    }
+
+    impl<'a> RecordSlice<'a> for TestRecordSlice<'a> {
+        type Owned = TestRecord;
+
         fn start(&self) -> u32 {
             self.start
         }
 
         fn end(&self) -> u32 {
             self.end
+        }
+
+        fn from_bytes(bytes: &'a [u8]) -> Self {
+            bincode::deserialize(bytes)
+                .map_err(|e| HgIndexError::StringError(e.to_string()))
+                .unwrap()
+        }
+
+        fn to_owned(self) -> Self::Owned {
+            Self::Owned {
+                start: self.start,
+                end: self.end,
+                name: self.name.to_owned(),
+                score: self.score,
+                tags: self.tags.into_iter().map(|v| v.to_string()).collect(),
+            }
+        }
+    }
+
+    impl From<TestRecordSlice<'_>> for TestRecord {
+        fn from(slice: TestRecordSlice<'_>) -> Self {
+            Self {
+                start: slice.start,
+                end: slice.end,
+                name: slice.name.to_owned(),
+                score: slice.score,
+                tags: slice.tags.iter().map(|&s| s.to_owned()).collect(),
+            }
+        }
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct MinimalTestRecord {
+        start: u32,
+        end: u32,
+        score: f64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct MinimalTestRecordSlice<'a> {
+        start: u32,
+        end: u32,
+        score: f64,
+        _lifetime: PhantomData<&'a ()>,
+    }
+
+    impl Record for MinimalTestRecord {
+        type Slice<'a> = MinimalTestRecordSlice<'a>;
+        fn start(&self) -> u32 {
+            self.start
+        }
+        fn end(&self) -> u32 {
+            self.end
+        }
+        fn to_bytes(&self) -> Vec<u8> {
+            bincode::serialize(self).unwrap()
+        }
+    }
+
+    impl<'a> RecordSlice<'a> for MinimalTestRecordSlice<'a> {
+        type Owned = MinimalTestRecord;
+        fn start(&self) -> u32 {
+            self.start
+        }
+        fn end(&self) -> u32 {
+            self.end
+        }
+        fn from_bytes(bytes: &'a [u8]) -> Self {
+            bincode::deserialize(bytes)
+                .map_err(|e| HgIndexError::StringError(e.to_string()))
+                .unwrap()
+        }
+
+        fn to_owned(self) -> Self::Owned {
+            Self::Owned {
+                start: self.start,
+                end: self.end,
+                score: self.score,
+            }
+        }
+    }
+
+    impl From<MinimalTestRecordSlice<'_>> for MinimalTestRecord {
+        fn from(slice: MinimalTestRecordSlice<'_>) -> Self {
+            Self {
+                start: slice.start,
+                end: slice.end,
+                score: slice.score,
+            }
         }
     }
 
@@ -483,6 +536,8 @@ mod tests {
         ]
     }
 
+    // --- Test Functions ---
+
     #[test]
     fn test_store_and_retrieve() {
         let test_dir = TestDir::new("store_and_retrieve").expect("Failed to create test dir");
@@ -492,7 +547,7 @@ mod tests {
         let key = "example-key".to_string();
 
         // Create store and add records
-        let mut store = GenomicDataStore::<TestRecord, ()>::create(base_dir, Some(key.clone()))
+        let mut store = GenomicDataStore::<TestRecord>::create(base_dir, Some(key.clone()))
             .expect("Failed to create store");
         for (chrom, record) in make_test_records() {
             store
@@ -502,7 +557,7 @@ mod tests {
 
         store.finalize().expect("Failed to finalize store");
 
-        let mut store = GenomicDataStore::<TestRecord, ()>::open(&base_dir, Some(key.clone()))
+        let mut store = GenomicDataStore::<TestRecord>::open(&base_dir, Some(key.clone()))
             .expect("Failed to open store");
 
         // Test overlapping query
@@ -531,7 +586,7 @@ mod tests {
         file.write_all(b"BAD!").expect("Failed to write");
 
         // Attempt to open should fail
-        let result = GenomicDataStore::<TestRecord, ()>::open(&bad_file, None);
+        let result = GenomicDataStore::<TestRecord>::open(&bad_file, None);
         assert!(result.is_err());
     }
 
@@ -540,77 +595,17 @@ mod tests {
         let test_dir = TestDir::new("empty_regions").expect("Failed to create test dir");
         let store_path = test_dir.path().join("empty.gidx");
 
-        let mut store = GenomicDataStore::<TestRecord, ()>::create(&store_path, None)
+        let mut store = GenomicDataStore::<TestRecord>::create(&store_path, None)
             .expect("Failed to create store");
 
         store.finalize().expect("Failed to finalize store");
 
         // Query empty store
-        let mut store = GenomicDataStore::<TestRecord, ()>::open(&store_path, None)
-            .expect("Failed to open store");
+        let mut store =
+            GenomicDataStore::<TestRecord>::open(&store_path, None).expect("Failed to open store");
 
         let results = store.get_overlapping("chr1", 0, 1000).unwrap();
         assert_eq!(results.len(), 0);
-    }
-
-    #[test]
-    fn test_metadata_handling() {
-        let test_dir = TestDir::new("metadata").expect("Failed to create test dir");
-        let store_path = test_dir.path().join("meta.gidx");
-
-        // Create a store with initial metadata
-        let mut store = GenomicDataStore::<TestRecord, String>::create(&store_path, None)
-            .expect("Failed to create store");
-
-        // Index must be created before metadata.
-        store.finalize().unwrap();
-        store.set_metadata("initial metadata".to_string());
-
-        // Test metadata access
-        assert_eq!(store.metadata(), Some(&"initial metadata".to_string()));
-
-        // Test metadata mutation
-        if let Some(meta) = store.metadata_mut() {
-            meta.push_str(" - updated");
-        }
-        assert_eq!(
-            store.metadata(),
-            Some(&"initial metadata - updated".to_string())
-        );
-
-        // Test metadata replacement
-        store.set_metadata("new metadata".to_string());
-        assert_eq!(store.metadata(), Some(&"new metadata".to_string()));
-
-        // Test metadata removal
-        let taken = store.take_metadata();
-        assert_eq!(taken, Some("new metadata".to_string()));
-        assert_eq!(store.metadata(), None);
-
-        store.finalize().expect("Failed to finalize store");
-
-        // Test metadata persistence
-        let reopened = GenomicDataStore::<TestRecord, String>::open(&store_path, None)
-            .expect("Failed to open store");
-        assert_eq!(reopened.metadata(), None);
-    }
-
-    // A minimal test record
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
-    struct MinimalTestRecord {
-        start: u32,
-        end: u32,
-        score: f64,
-    }
-
-    impl GenomicCoordinates for MinimalTestRecord {
-        fn start(&self) -> u32 {
-            self.start
-        }
-
-        fn end(&self) -> u32 {
-            self.end
-        }
     }
 
     #[test]
@@ -623,7 +618,7 @@ mod tests {
 
         // Create and populate store
         {
-            let mut store = GenomicDataStore::<MinimalTestRecord, ()>::create(&store_path, None)
+            let mut store = GenomicDataStore::<MinimalTestRecord>::create(&store_path, None)
                 .expect("Failed to create store");
 
             // Add some overlapping records
@@ -652,7 +647,7 @@ mod tests {
             .map(|i| {
                 let path = Arc::clone(&path);
                 thread::spawn(move || {
-                    let mut store = GenomicDataStore::<MinimalTestRecord, ()>::open(&path, None)
+                    let mut store = GenomicDataStore::<MinimalTestRecord>::open(&path, None)
                         .expect("Failed to open store");
 
                     // Each thread queries a different but overlapping region
@@ -676,5 +671,55 @@ mod tests {
         // Verify that at least some threads got different numbers of results
         // due to querying different regions
         assert!(result_counts.iter().any(|&x| x != result_counts[0]));
+    }
+
+    #[test]
+    fn test_map_vs_get_consistency() {
+        let test_dir = TestDir::new("map_vs_get_consistency").expect("Failed to create test dir");
+        let base_dir = test_dir.path();
+
+        // Create the store and add test records
+        let mut store = GenomicDataStore::<TestRecord>::create(base_dir, None)
+            .expect("Failed to create GenomicDataStore");
+        for (chrom, record) in make_test_records() {
+            store
+                .add_record(&chrom, &record)
+                .expect("Failed to add record");
+        }
+        store.finalize().expect("Failed to finalize store");
+
+        // Reopen the finalized store
+        let mut store = GenomicDataStore::<TestRecord>::open(base_dir, None)
+            .expect("Failed to open GenomicDataStore");
+
+        // Define test queries
+        let queries = vec![
+            ("chr1", 1200, 1800),
+            ("chr1", 0, 3000),
+            ("chr2", 50000, 60000),
+            ("chr2", 55000, 58000),
+            ("chr3", 0, 10000),
+        ];
+
+        for (chrom, start, end) in queries {
+            // Get overlapping records
+            let get_results = store.get_overlapping(chrom, start, end).unwrap().to_vec();
+
+            // Map overlapping records
+            let mut map_results = Vec::new();
+            store
+                .map_overlapping(chrom, start, end, |record| {
+                    map_results.push(record.to_owned());
+                    Ok(())
+                })
+                .unwrap();
+
+            // Assert that both results are identical
+            assert_eq!(
+                get_results, map_results,
+                "Mismatch for chrom: {}, start: {}, end: {}",
+                chrom, start, end
+            );
+        }
     }
 }

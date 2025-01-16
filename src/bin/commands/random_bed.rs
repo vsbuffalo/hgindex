@@ -49,12 +49,12 @@ pub fn run(args: RandomBedArgs) -> Result<(), HgIndexError> {
     // Re-usable line buffer
     let mut line_buffer = String::new();
 
-    for record in records {
+    for (chrom, record) in records {
         line_buffer.clear(); // Clear the buffer for the next record
         write!(
             line_buffer,
             "{}\t{}\t{}\t{}",
-            record.chrom, record.start, record.end, record.rest
+            chrom, record.start, record.end, record.rest
         )
         .unwrap();
         writeln!(output_writer, "{}", line_buffer)?; // Write the record
@@ -64,7 +64,7 @@ pub fn run(args: RandomBedArgs) -> Result<(), HgIndexError> {
     Ok(())
 }
 
-fn generate_random_bed_records(num_records: usize, seed: Option<u64>) -> Vec<BedRecord> {
+fn generate_random_bed_records(num_records: usize, seed: Option<u64>) -> Vec<(String, BedRecord)> {
     const CHROMS: &[&str] = &["chr1", "chr2", "chr3", "chr4", "chr5", "chrX", "chrY"];
     const FEATURE_TYPES: &[&str] = &[
         "gene",
@@ -91,10 +91,9 @@ fn generate_random_bed_records(num_records: usize, seed: Option<u64>) -> Vec<Bed
     }
 
     records.sort_by(|a, b| {
-        let chrom_cmp = compare_chromosomes(&a.chrom, &b.chrom);
-        chrom_cmp
-            .then(a.start.cmp(&b.start))
-            .then(a.end.cmp(&b.end))
+        a.0.cmp(&b.0)
+            .then(a.1.start.cmp(&b.1.start))
+            .then(a.1.end.cmp(&b.1.end))
     });
 
     records
@@ -104,7 +103,7 @@ fn generate_single_record<R: Rng>(
     rng: &mut R,
     chroms: &[&str],
     feature_types: &[&str],
-) -> BedRecord {
+) -> (String, BedRecord) {
     let chrom = *chroms.choose(rng).unwrap();
     let start = rng.gen_range(0..1_000_000);
     let length = rng.gen_range(100..10_000);
@@ -116,12 +115,7 @@ fn generate_single_record<R: Rng>(
         .collect::<Vec<_>>()
         .join("\t");
 
-    BedRecord {
-        chrom: chrom.to_string(),
-        start,
-        end,
-        rest,
-    }
+    (chrom.to_string(), BedRecord { start, end, rest })
 }
 
 fn generate_extra_field<R: Rng>(rng: &mut R, feature_types: &[&str]) -> String {
@@ -138,6 +132,7 @@ fn generate_extra_field<R: Rng>(rng: &mut R, feature_types: &[&str]) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn compare_chromosomes(a: &str, b: &str) -> std::cmp::Ordering {
     fn chrom_value(chrom: &str) -> u32 {
         chrom

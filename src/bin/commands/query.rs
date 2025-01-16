@@ -6,8 +6,8 @@ use flate2::Compression;
 use hgindex::error::HgIndexError;
 use hgindex::io::OutputStream;
 use hgindex::store::GenomicDataStore;
-use hgindex::BedRecord;
-use std::fmt::Write;
+use hgindex::{BedRecord, BedRecordSlice};
+use itoa;
 use std::fs;
 use std::fs::File;
 use std::path::PathBuf;
@@ -44,7 +44,7 @@ pub fn run(args: QueryArgs) -> Result<(), HgIndexError> {
     // Builder output file, possibly compressed
     let output_stream = OutputStream::builder()
         .filepath(args.output)
-        .buffer_size(256 * 1024)
+        .buffer_size(1024 * 1024)
         .compression_level(None::<Compression>)
         .build();
     let mut output_writer = output_stream.writer()?;
@@ -61,7 +61,7 @@ pub fn run(args: QueryArgs) -> Result<(), HgIndexError> {
     }
 
     // Open store once for all queries
-    let mut store = GenomicDataStore::<BedRecord, ()>::open(&input_path, None)?;
+    let mut store = GenomicDataStore::<BedRecord>::open(&input_path, None)?;
 
     if let Some(region) = args.region {
         // Single region query
@@ -83,36 +83,24 @@ pub fn run(args: QueryArgs) -> Result<(), HgIndexError> {
 }
 
 fn query_single_region<W: std::io::Write>(
-    store: &mut GenomicDataStore<BedRecord, ()>,
+    store: &mut GenomicDataStore<BedRecord>,
     region: &str,
     output_writer: &mut W,
 ) -> Result<(), HgIndexError> {
     let (seqname, start, end) = parse_region(region)?;
-    // let records = store.get_overlapping(seqname, start, end)?;
-    let records = store.get_overlapping_batch(seqname, start, end)?;
 
-    // Re-usable line buffer
-    let mut line_buffer = String::new();
+    // Use `map_overlapping` for efficient ZCD
+    let record_count = store.map_overlapping(&seqname, start, end, |record_slice| {
+        write_tsv_bytes(&seqname, &record_slice, output_writer)?;
+        Ok(())
+    })?;
 
-    eprintln!("{} records found.", records.len());
-
-    // Write all matching records to output at once
-    for record in records {
-        line_buffer.clear(); // Clear the buffer for the next record
-        write!(
-            line_buffer,
-            "{}\t{}\t{}\t{}",
-            record.chrom, record.start, record.end, record.rest
-        )
-        .unwrap();
-        writeln!(output_writer, "{}", line_buffer)?; // Write the record
-    }
-
+    eprintln!("{} records processed.", record_count);
     Ok(())
 }
 
 fn query_bed_regions<W: std::io::Write>(
-    store: &mut GenomicDataStore<BedRecord, ()>,
+    store: &mut GenomicDataStore<BedRecord>,
     regions_file: &PathBuf,
     output_writer: &mut W,
 ) -> Result<(), HgIndexError> {
@@ -123,11 +111,12 @@ fn query_bed_regions<W: std::io::Write>(
         .from_reader(File::open(regions_file)?);
 
     let mut total_records = 0;
-    let mut writer = output_writer; // Create local mutable binding
+    // Initialize batch with reasonable starting capacity
+    let mut batch = RecordBatch::with_capacity(64 * 1024);
 
     for record in reader.records() {
         let record = record?;
-        let chrom = record.get(0).ok_or("Missing chrom")?;
+        let chrom = record.get(0).ok_or("Missing chrom")?.to_string();
         let start: u32 = record
             .get(1)
             .ok_or("Missing start")?
@@ -139,21 +128,34 @@ fn query_bed_regions<W: std::io::Write>(
             .parse()
             .map_err(|_| "Invalid end coordinate")?;
 
-        let records_found = store.map_overlapping_batch(chrom, start, end, |bytes| {
-            write_tsv_bytes(bytes, &mut writer)
-        })?;
+        let records = store.get_overlapping_batch(&chrom, start, end)?;
+        for record in records {
+            batch.push_record(&chrom, &record);
+            if batch.should_flush() {
+                batch.write_batch(output_writer)?;
+            }
+            total_records += 1;
+        }
+    }
 
-        total_records += records_found;
+    // Flush any remaining records
+    if batch.records_seen > 0 {
+        batch.write_batch(output_writer)?;
     }
 
     eprintln!("Found {} total records.", total_records);
     Ok(())
 }
 
-fn write_tsv_bytes<W: std::io::Write>(bytes: &[u8], writer: &mut W) -> Result<(), HgIndexError> {
-    // Assuming your serialized format matches your TSV format
-    // If not, you'll need custom parsing logic here
-    writer.write_all(bytes)?;
+#[inline(always)]
+fn write_tsv_bytes<W: std::io::Write>(
+    chrom: &str,
+    record: &BedRecordSlice<'_>,
+    writer: &mut W,
+) -> Result<(), HgIndexError> {
+    // Directly write to the writer without intermediate buffer
+    write!(writer, "{}\t{}\t{}\t", chrom, record.start, record.end)?;
+    writer.write_all(record.rest)?; // Raw bytes, no conversion
     writer.write_all(b"\n")?;
     Ok(())
 }
@@ -203,5 +205,70 @@ fn find_default_hgidx_file() -> Result<PathBuf, Box<dyn std::error::Error>> {
         Err("No .hgidx file found in the current directory.".into())
     } else {
         Err("Multiple .hgidx files found, please specify one.".into())
+    }
+}
+
+// Struct to batch records and minimize allocations
+pub struct RecordBatch {
+    // Pre-allocated buffer for collecting records
+    buffer: Vec<u8>,
+    // Capacity tracking to avoid too many resizes
+    records_seen: usize,
+    // Add dedicated number buffers to avoid allocations
+    start_buffer: itoa::Buffer,
+    end_buffer: itoa::Buffer,
+}
+
+impl RecordBatch {
+    pub fn with_capacity(bytes: usize) -> Self {
+        Self {
+            buffer: Vec::with_capacity(bytes),
+            records_seen: 0,
+            start_buffer: itoa::Buffer::new(),
+            end_buffer: itoa::Buffer::new(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn push_record(&mut self, chrom: &str, record: &BedRecordSlice<'_>) {
+        // Extend chrom bytes
+        self.buffer.extend_from_slice(chrom.as_bytes());
+        self.buffer.push(b'\t');
+
+        // Format integers using dedicated buffers
+        let start_str = self.start_buffer.format(record.start);
+        let end_str = self.end_buffer.format(record.end);
+
+        self.buffer.extend_from_slice(start_str.as_bytes());
+        self.buffer.push(b'\t');
+        self.buffer.extend_from_slice(end_str.as_bytes());
+        self.buffer.push(b'\t');
+
+        // Rest of record and newline
+        self.buffer.extend_from_slice(record.rest);
+        self.buffer.push(b'\n');
+
+        self.records_seen += 1;
+    }
+
+    // Flush when batch is large enough
+    #[inline(always)]
+    pub fn should_flush(&self) -> bool {
+        self.records_seen >= 1000 || self.buffer.len() >= 64 * 1024
+    }
+
+    #[inline(always)]
+    pub fn write_batch<W: std::io::Write>(&mut self, writer: &mut W) -> Result<(), HgIndexError> {
+        writer.write_all(&self.buffer)?;
+        self.clear();
+        Ok(())
+    }
+
+    pub fn clear(&mut self) {
+        // Clears the underlying Vec<u8> without deallocating memory
+        self.buffer.clear();
+        // Reset the record counter
+        self.records_seen = 0;
+        // Note: we don't need to clear itoa::Buffer as it's reused in-place
     }
 }

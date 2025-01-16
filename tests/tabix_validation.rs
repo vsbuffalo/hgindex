@@ -26,9 +26,7 @@ fn test_tabix_compatibility() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set up paths
     let test_dir = PathBuf::from("target/test_files");
-    // Create test directory
     fs::create_dir_all(&test_dir)?;
-    // Now, can canonicalize after creating
     let test_dir = test_dir.canonicalize()?;
     let test_bed = test_dir.join("test.bed");
     let bgzipped = test_dir.join("test.bed.bgz");
@@ -38,9 +36,6 @@ fn test_tabix_compatibility() -> Result<(), Box<dyn std::error::Error>> {
     println!("BED file: {}", test_bed.display());
     println!("BGZip file: {}", bgzipped.display());
     println!("HGIndex file: {}", hgindex.display());
-
-    // Create test directory
-    fs::create_dir_all(&test_dir)?;
 
     // Print tool versions
     let bgzip_version = Command::new("bgzip").arg("--version").output()?;
@@ -135,21 +130,88 @@ fn test_tabix_compatibility() -> Result<(), Box<dyn std::error::Error>> {
         "Tabix index file was not created"
     );
 
-    // Run a simple query to verify the index works
-    let test_region = "chr1:15000-17000";
-    println!("Testing query for region: {}", test_region);
+    // Run HGIndex pack
+    println!("Running HGIndex pack...");
+    let mut pack_command = Command::new("cargo");
+    pack_command
+        .arg("run")
+        .arg("--release")
+        .arg("--features=cli,dev")
+        .arg("--")
+        .arg("pack")
+        .arg(&test_bed)
+        .arg("--output")
+        .arg(&hgindex)
+        .arg("--force"); // Add force flag to overwrite if exists
 
-    let query_output = Command::new("tabix")
-        .arg(&bgzipped)
-        .arg(test_region)
-        .output()?;
+    println!("Running pack command: {:?}", &pack_command);
+    let pack_output = pack_command.output()?;
 
-    if !query_output.status.success() {
-        let stderr = String::from_utf8_lossy(&query_output.stderr);
-        println!("Query error: {}", stderr);
-        return Err("Tabix query failed".into());
+    if !pack_output.status.success() {
+        let stderr = String::from_utf8_lossy(&pack_output.stderr);
+        println!("HGIndex pack error: {}", stderr);
+        return Err("HGIndex pack failed".into());
     }
 
-    println!("Test completed successfully");
+    // Verify HGIndex file exists
+    assert!(Path::new(&hgindex).exists(), "HGIndex file was not created");
+
+    // Run queries with both tools and compare outputs
+    let test_regions = vec![
+        "chr1:15000-17000",
+        "chr1:1-1000000",
+        "chr2:500000-600000",
+        "chrX:1000000-2000000",
+    ];
+
+    for region in test_regions {
+        println!("Testing region: {}", region);
+        // Get tabix results
+        let tabix_output = Command::new("tabix").arg(&bgzipped).arg(region).output()?;
+        if !tabix_output.status.success() {
+            let stderr = String::from_utf8_lossy(&tabix_output.stderr);
+            println!("Tabix query error: {}", stderr);
+            return Err("Tabix query failed".into());
+        }
+
+        // Get HGIndex results
+        let mut hgindex_command = Command::new("cargo");
+        hgindex_command
+            .arg("run")
+            .arg("--release")
+            .arg("--features=cli,dev")
+            .arg("--")
+            .arg("query")
+            .arg("-i")
+            .arg(&hgindex)
+            .arg(region);
+
+        println!("Running command: {:?}", &hgindex_command);
+        let hgindex_output = hgindex_command.output()?;
+
+        if !hgindex_output.status.success() {
+            let stderr = String::from_utf8_lossy(&hgindex_output.stderr);
+            println!("HGIndex query error: {}", stderr);
+            return Err("HGIndex query failed".into());
+        }
+
+        // Compare outputs line by line to avoid any newline issues
+        let tabix_data = String::from_utf8(tabix_output.stdout)?;
+        let mut tabix_lines: Vec<&str> = tabix_data.lines().collect();
+        let hgindex_data = String::from_utf8(hgindex_output.stdout)?;
+        let mut hgindex_lines: Vec<&str> = hgindex_data.lines().collect();
+
+        tabix_lines.sort();
+        hgindex_lines.sort();
+
+        assert_eq!(tabix_lines.len(), hgindex_lines.len());
+
+        assert_eq!(
+            tabix_lines, hgindex_lines,
+            "Results don't match for region {}\nTabix output:\n{:#?}\nHGIndex output:\n{:#?}",
+            region, tabix_lines, hgindex_lines
+        );
+    }
+
     Ok(())
 }

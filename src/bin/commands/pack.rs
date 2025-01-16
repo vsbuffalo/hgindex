@@ -63,7 +63,7 @@ pub fn run(args: PackArgs) -> Result<(), HgIndexError> {
 
     // Create store
     let mut store =
-        GenomicDataStore::<BedRecord, ()>::create_with_schema(&output_path, None, &args.schema)?;
+        GenomicDataStore::<BedRecord>::create_with_schema(&output_path, None, &args.schema)?;
 
     let mut csv_reader = build_tsv_reader(
         &args.input,
@@ -117,7 +117,6 @@ pub fn run(args: PackArgs) -> Result<(), HgIndexError> {
 
         // Create BedRecord
         let bed_record = BedRecord {
-            chrom: chrom.clone(),
             start: adj_start,
             end: adj_end,
             rest,

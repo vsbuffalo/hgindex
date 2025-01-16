@@ -23,32 +23,33 @@ masker track as the database, and the UCSC RefGene track as the query:
 
 
 ```
-$ hyperfine --warmup 10 \
-'./target/release/hgidx  query --regions tests/data/refgene.bed --input tests/data/repeat_masker_autosomes.hgidx > /dev/null' \
-'tabix tests/data/repeat_masker_autosomes.bed.bgz --regions tests/data/refgene.bed > /dev/null'
-    Finished `release` profile [optimized] target(s) in 0.22s
-Benchmark 1: ./target/release/hgidx  query --regions tests/data/refgene.bed --input tests/data/repeat_masker_autosomes.hgidx > /dev/null
-  Time (mean ± σ):     298.0 ms ±   3.3 ms    [User: 249.4 ms, System: 44.8 ms]
-  Range (min … max):   294.5 ms … 305.2 ms    10 runs
+$ cargo build --release --features=cli,dev && hyperfine --warmup 10 --min-runs 20 \
+  './target/release/hgidx query --regions tests/data/refgene.bed --input tests/data/repeat_masker_autosomes.hgidx > /dev/null' \
+  'tabix tests/data/repeat_masker_autosomes.bed.bgz --regions tests/data/refgene.bed > /dev/null'
+    Finished `release` profile [optimized] target(s) in 0.26s
+Benchmark 1: ./target/release/hgidx query --regions tests/data/refgene.bed --input tests/data/repeat_masker_autosomes.hgidx > /dev/null
+  Time (mean ± σ):     486.3 ms ±  20.5 ms    [User: 415.5 ms, System: 48.2 ms]
+  Range (min … max):   460.7 ms … 551.1 ms    20 runs
 
 Benchmark 2: tabix tests/data/repeat_masker_autosomes.bed.bgz --regions tests/data/refgene.bed > /dev/null
-  Time (mean ± σ):      3.535 s ±  0.022 s    [User: 3.426 s, System: 0.083 s]
-  Range (min … max):    3.510 s …  3.573 s    10 runs
+  Time (mean ± σ):      2.772 s ±  0.037 s    [User: 2.633 s, System: 0.066 s]
+  Range (min … max):    2.710 s …  2.859 s    20 runs
 
 Summary
-  ./target/release/hgidx  query --regions tests/data/refgene.bed --input tests/data/repeat_masker_autosomes.hgidx > /dev/null ran
-   11.87 ± 0.15 times faster than tabix tests/data/repeat_masker_autosomes.bed.bgz --regions tests/data/refgene.bed > /dev/null
+  ./target/release/hgidx query --regions tests/data/refgene.bed --input tests/data/repeat_masker_autosomes.hgidx > /dev/null ran
+    5.70 ± 0.25 times faster than tabix tests/data/repeat_masker_autosomes.bed.bgz --regions tests/data/refgene.bed > /dev/null
 
 $ ll tests/data/repeat_masker.bed tests/data/repeat_masker.bed.bgz tests/data/repeat_masker.bed.bgz.tbi;\
  du -h tests/data/repeat_masker_autosomes.hgidx
--rw-r--r--@ 1 vsb  staff   444M Jan 12 14:47 tests/data/repeat_masker.bed
--rw-r--r--@ 1 vsb  staff   140M Jan 12 14:48 tests/data/repeat_masker.bed.bgz
--rw-r--r--@ 1 vsb  staff   560K Jan 12 14:48 tests/data/repeat_masker.bed.bgz.tbi
-534M	tests/data/repeat_masker_autosomes.hgidx
+
+-rw-r--r--@ 1 vsb  staff   444M Jan 15 00:16 tests/data/repeat_masker.bed
+-rw-r--r--@ 1 vsb  staff   140M Jan 15 01:17 tests/data/repeat_masker.bed.bgz
+-rw-r--r--@ 1 vsb  staff   560K Jan 15 01:17 tests/data/repeat_masker.bed.bgz.tbi
+472M	tests/data/repeat_masker_autosomes.hgidx
 
 ```
 
-So presently hgindex is about 12x faster than tabix, with about 4.3x the disk
+So presently hgindex is about 12x faster than tabix, with about 3.4x the disk
 usage.
 
 Here is an older benchmark for reference, before zero copy deserialization:

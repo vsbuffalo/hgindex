@@ -54,11 +54,12 @@ use serde::{Deserialize, Serialize};
 ///
 ///
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct HierarchicalBins {
-    /// For hierarchical bins (17 = 128kb)
+    pub schema: BinningSchema,
+    /// For hierarchical bins
     pub base_shift: u32,
-    /// For level scaling (3 = 8x between levels)
+    /// For level scaling
     pub level_shift: u32,
     /// Number of bin levels
     pub num_levels: usize,
@@ -66,13 +67,13 @@ pub struct HierarchicalBins {
     pub levels: Vec<u32>,
     /// Offsets for each level
     pub bin_offsets: Vec<u32>,
-    /// For linear index (14 = 16kb)
-    pub linear_shift: u32,
+    /// For optional linear index
+    pub linear_shift: Option<u32>,
 }
 
 impl Default for HierarchicalBins {
     fn default() -> Self {
-        Self::tabix()
+        Self::from_schema(&BinningSchema::default())
     }
 }
 
@@ -112,19 +113,38 @@ pub fn calc_offsets(next_shift: u32, nlevels: usize) -> Vec<u32> {
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Clone)]
 #[cfg_attr(feature = "cli", derive(ValueEnum))]
 pub enum BinningSchema {
-    Dense,
-    Sparse,
     #[default]
     Tabix,
+    TabixNoLinear,
     Ucsc,
+    UcscNoLinear,
+    Dense,
+    Sparse,
 }
 
 impl HierarchicalBins {
-    // Create a new binning scheme with custom parameters
-    pub fn new(base_shift: u32, level_shift: u32, num_levels: usize, linear_shift: u32) -> Self {
+    pub fn from_schema(schema: &BinningSchema) -> Self {
+        match schema {
+            BinningSchema::Tabix => Self::tabix(),
+            BinningSchema::TabixNoLinear => Self::tabix_no_linear(),
+            BinningSchema::Ucsc => Self::ucsc(),
+            BinningSchema::UcscNoLinear => Self::ucsc_no_linear(),
+            BinningSchema::Dense => Self::dense(),
+            BinningSchema::Sparse => Self::sparse(),
+        }
+    }
+
+    pub fn new(
+        schema_type: BinningSchema,
+        base_shift: u32,
+        level_shift: u32,
+        num_levels: usize,
+        linear_shift: Option<u32>,
+    ) -> Self {
         let levels = calc_level_sizes(level_shift, num_levels);
         let bin_offsets = calc_offsets_from_levels(&levels);
         Self {
+            schema: schema_type,
             base_shift,
             level_shift,
             num_levels,
@@ -134,54 +154,40 @@ impl HierarchicalBins {
         }
     }
 
-    pub fn from_schema(schema: &BinningSchema) -> Self {
-        match schema {
-            BinningSchema::Ucsc => Self::ucsc(),
-            BinningSchema::Tabix => Self::tabix(),
-            BinningSchema::Dense => Self::dense(),
-            BinningSchema::Sparse => Self::sparse(),
-        }
-    }
-
-    // Create the classic UCSC configuration
-    pub fn ucsc() -> Self {
-        Self::new(17, 3, 5, 14) // 128kb base bins, 8x scaling, 5 levels, 16kb linear bins
-    }
-
-    // Add this method
     pub fn tabix() -> Self {
-        Self {
-            base_shift: 14,                  // Start with 16kb bins (2^14)
-            level_shift: 3,                  // 8x scaling (2^3)
-            num_levels: 6,                   // 6 levels to reach larger bins
-            levels: calc_level_sizes(3, 6),  // Calculate bins per level
-            bin_offsets: calc_offsets(3, 6), // Calculate offsets [4681,585,73,9,1,0]
-            linear_shift: 14,                // 16kb linear index (same as UCSC)
-        }
+        Self::new(BinningSchema::Tabix, 14, 3, 6, Some(14))
     }
 
-    // Create a denser binning scheme for higher resolution
+    pub fn tabix_no_linear() -> Self {
+        Self::new(BinningSchema::TabixNoLinear, 14, 3, 6, None)
+    }
+
+    pub fn ucsc() -> Self {
+        Self::new(BinningSchema::Ucsc, 17, 3, 5, Some(14))
+    }
+
+    pub fn ucsc_no_linear() -> Self {
+        Self::new(BinningSchema::UcscNoLinear, 17, 3, 5, None)
+    }
+
     pub fn dense() -> Self {
-        Self::new(14, 2, 6, 12) // 16kb base bins, 4x scaling, 6 levels, 4kb linear bins
+        Self::new(BinningSchema::Dense, 14, 2, 6, Some(12))
     }
 
-    // Create a sparser scheme for large regions
     pub fn sparse() -> Self {
-        Self::new(20, 4, 4, 16) // 1Mb base bins, 16x scaling, 4 levels, 64kb linear bins
+        Self::new(BinningSchema::Sparse, 20, 4, 4, Some(16))
     }
 
-    /// Find the smallest bin that fully contains this range,
-    /// [start, end).
+    pub fn uses_linear_index(&self) -> bool {
+        self.linear_shift.is_some()
+    }
+
+    /// Compute the smallest bin fully containing the range `[start, end)`.
     pub fn region_to_bin(&self, start: u32, end: u32) -> u32 {
-        let mut start_bin = start;
-        let mut end_bin = end - 1; // Exclusive end, so subtract 1 (internally it's inclusive)
+        let mut start_bin = start >> self.base_shift;
+        let mut end_bin = (end - 1) >> self.base_shift;
 
-        // First shift
-        start_bin >>= self.base_shift;
-        end_bin >>= self.base_shift;
-
-        // Check each level
-        for &offset in self.bin_offsets.iter() {
+        for &offset in &self.bin_offsets {
             if start_bin == end_bin {
                 return offset + start_bin;
             }
@@ -189,38 +195,75 @@ impl HierarchicalBins {
             end_bin >>= self.level_shift;
         }
 
-        panic!("start {}, end {} out of range in region_to_bin", start, end);
+        panic!(
+            "start {}, end {} out of range for region_to_bin",
+            start, end
+        );
     }
 
-    /// Find all bins that could contain features overlapping this range [start, end).
-    /// This is used when searching for overlaps, as we need to check multiple bins
-    /// across different levels.
+    /// Compute all bins potentially overlapping the range `[start, end)`.
     pub fn region_to_bins(&self, start: u32, end: u32) -> Vec<u32> {
         let mut bins = Vec::new();
-        let mut start_bin = start;
-        let mut end_bin = end - 1; // Exclusive end, so subtract 1 (internally it's inclusive)
+        let mut start_bin = start >> self.base_shift;
+        let mut end_bin = (end - 1) >> self.base_shift;
 
-        // First shift with the initial shift amount
-        start_bin >>= self.base_shift;
-        end_bin >>= self.base_shift;
-
-        // For each level
-        for &offset in self.bin_offsets.iter() {
-            // Calculate all bins for this level between start and end
-            let level_start = start_bin;
-            let level_end = end_bin;
-
-            // Add all bins in this level's range
-            for bin in level_start..=level_end {
-                bins.push(offset + bin);
-            }
-
-            // Shift to next level (right shift by the level_shift)
+        for &offset in &self.bin_offsets {
+            bins.extend(offset + start_bin..=offset + end_bin);
             start_bin >>= self.level_shift;
             end_bin >>= self.level_shift;
         }
 
         bins
+    }
+
+    pub fn region_to_bins_iter(&self, start: u32, end: u32) -> RegionToBins {
+        let start_bin = start >> self.base_shift;
+        let end_bin = (end - 1) >> self.base_shift;
+
+        RegionToBins {
+            current_level: 0,
+            start_bin,
+            end_bin,
+            bin_offsets: &self.bin_offsets,
+            level_shift: self.level_shift,
+        }
+    }
+}
+
+pub struct RegionToBins<'a> {
+    current_level: usize,
+    start_bin: u32,
+    end_bin: u32,
+    bin_offsets: &'a [u32],
+    level_shift: u32,
+}
+
+impl Iterator for RegionToBins<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_level >= self.bin_offsets.len() {
+            return None; // No more levels to iterate
+        }
+
+        // Return the current bin
+        let current_bin = self.bin_offsets[self.current_level] + self.start_bin;
+
+        if self.start_bin < self.end_bin {
+            // Move to the next bin within the current level
+            self.start_bin += 1;
+        } else {
+            // Move to the next level
+            self.current_level += 1;
+
+            if self.current_level < self.bin_offsets.len() {
+                // Reset bins for the next level
+                self.start_bin >>= self.level_shift;
+                self.end_bin >>= self.level_shift;
+            }
+        }
+
+        Some(current_bin)
     }
 }
 

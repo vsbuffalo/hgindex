@@ -24,6 +24,7 @@ flate2 = { version = "1.0.35", optional = true }
 memmap2 = "0.9.5"
 rustc-hash = "2.1.0"
 num_cpus = "1.16.0"
+itoa = "1.0.14"
 
 
 [dev-dependencies]

@@ -1,5 +1,3 @@
-use serde::{Deserialize, Serialize};
-
 pub mod error;
 pub mod index;
 #[cfg(feature = "cli")]
@@ -15,9 +13,6 @@ pub use store::GenomicDataStore;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
-
-pub trait SerdeType: Serialize + for<'de> Deserialize<'de> {}
-impl<T: Serialize + for<'de> Deserialize<'de>> SerdeType for T {}
 
 /// Trait for types that have genomic coordinates
 pub trait GenomicCoordinates {
