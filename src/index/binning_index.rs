@@ -1,6 +1,10 @@
 // binning_index.rs
 
-use std::{fs::File, io::BufWriter, path::Path};
+use std::{
+    fs::File,
+    io::{BufWriter, Write},
+    path::Path,
+};
 
 use super::binning::{BinningSchema, HierarchicalBins};
 use crate::error::HgIndexError;
@@ -65,6 +69,8 @@ pub struct BinningIndex {
     pub sequences: FxHashMap<String, SequenceIndex>,
     last_chrom: Option<String>,
     last_start: Option<u32>,
+    // Store metadata as raw bytes
+    metadata_bytes: Option<Vec<u8>>,
 }
 
 /// SequenceIndex stores the bin indices to the features they
@@ -75,8 +81,6 @@ pub struct SequenceIndex {
     pub bins: FxHashMap<u32, Vec<Feature>>,
     // Optional linear index for quick region queries
     pub linear_index: Option<LinearIndex>,
-    // Buffer of (offsets, lengths)
-    // overlap_buffer: Vec<(u64, u64)>,
 }
 
 impl Clone for SequenceIndex {
@@ -84,7 +88,6 @@ impl Clone for SequenceIndex {
         Self {
             bins: self.bins.clone(),
             linear_index: self.linear_index.clone(),
-            // overlap_buffer: Vec::with_capacity(130),
         }
     }
 }
@@ -115,7 +118,6 @@ impl<'de> Deserialize<'de> for SequenceIndex {
         Ok(SequenceIndex {
             bins: helper.bins,
             linear_index: helper.linear_index,
-            // overlap_buffer: Vec::with_capacity(130),
         })
     }
 }
@@ -127,7 +129,6 @@ impl SequenceIndex {
         SequenceIndex {
             bins: FxHashMap::default(),
             linear_index,
-            // overlap_buffer: Vec::with_capacity(130),
         }
     }
 
@@ -232,6 +233,7 @@ impl BinningIndex {
             sequences: FxHashMap::default(),
             last_chrom: None,
             last_start: None,
+            metadata_bytes: None,
         }
     }
 
@@ -291,13 +293,32 @@ impl BinningIndex {
     }
 
     /// Write the BinningIndex to a path by binary serialization.
-    pub fn serialize_to_path(
-        &mut self,
-        path: &Path,
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    pub fn finalize(&mut self, path: &Path) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let mut file = BufWriter::new(File::create(path)?);
         bincode::serialize_into(&mut file, &self)?;
         Ok(())
+    }
+
+    pub fn finalize_with_metadata<M: Serialize>(
+        &mut self,
+        path: &Path,
+        metadata: &M,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // Serialize metadata
+        self.metadata_bytes = Some(bincode::serialize(metadata)?);
+
+        // Write to file
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(file);
+        bincode::serialize_into(&mut writer, self)?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    pub fn metadata<M: for<'de> Deserialize<'de>>(&self) -> Option<M> {
+        self.metadata_bytes
+            .as_ref()
+            .and_then(|bytes| bincode::deserialize(bytes).ok())
     }
 }
 
@@ -469,7 +490,7 @@ mod tests {
         let path = Path::new("test_index.hgidx");
 
         // Serialize
-        index.serialize_to_path(&path).unwrap();
+        index.finalize(&path).unwrap();
 
         // Deserialize
         let deserialized_index = BinningIndex::open(&path).unwrap();

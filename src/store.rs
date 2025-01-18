@@ -10,6 +10,7 @@ use std::{
 };
 
 use memmap2::Mmap;
+use serde::{Deserialize, Serialize};
 
 use crate::{error::HgIndexError, index::BinningIndex, BinningSchema};
 use crate::{Record, RecordSlice};
@@ -133,7 +134,33 @@ impl<T: Record> GenomicDataStore<T> {
             self.directory.join(Self::INDEX_FILENAME)
         };
 
-        self.index.serialize_to_path(index_path.as_path())?;
+        self.index.finalize(index_path.as_path())?;
+        Ok(())
+    }
+
+    // Get metadata if it exists
+    pub fn metadata<M: for<'de> Deserialize<'de>>(&self) -> Option<M> {
+        self.index.metadata()
+    }
+
+    pub fn finalize_with_metadata<M>(
+        &mut self,
+        metadata: &M,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>>
+    where
+        M: Serialize + for<'de> Deserialize<'de>,
+    {
+        self.close_files()?;
+
+        // Write index to file
+        let index_path = if let Some(ref key) = self.key {
+            self.directory.join(key).join(Self::INDEX_FILENAME)
+        } else {
+            self.directory.join(Self::INDEX_FILENAME)
+        };
+
+        self.index
+            .finalize_with_metadata(index_path.as_path(), &metadata)?;
         Ok(())
     }
 
@@ -737,6 +764,68 @@ mod tests {
                 "Mismatch for chrom: {}, start: {}, end: {}",
                 chrom, start, end
             );
+        }
+    }
+
+    #[test]
+    fn test_metadata_storage_and_retrieval() {
+        use std::collections::HashMap;
+        let test_dir = TestDir::new("metadata_test").expect("Failed to create test dir");
+        let base_dir = test_dir.path();
+
+        // Create some test metadata (using a simple struct)
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct TestMetadata {
+            name: String,
+            values: HashMap<String, i32>,
+        }
+
+        let original_metadata = TestMetadata {
+            name: "test".to_string(),
+            values: {
+                let mut m = HashMap::new();
+                m.insert("key1".to_string(), 42);
+                m.insert("key2".to_string(), 100);
+                m
+            },
+        };
+
+        // Create and populate store
+        {
+            let mut store = GenomicDataStore::<TestRecord>::create(base_dir, None)
+                .expect("Failed to create store");
+
+            // Add some test records
+            let record = TestRecord {
+                start: 1000,
+                end: 2000,
+                name: "feature1".to_string(),
+                score: 0.5,
+                tags: vec!["test".to_string()],
+            };
+            store
+                .add_record("chr1", &record)
+                .expect("Failed to add record");
+
+            // Finalize with metadata
+            store
+                .finalize_with_metadata(&original_metadata)
+                .expect("Failed to finalize with metadata");
+        }
+
+        // Reopen and check metadata
+        {
+            let store =
+                GenomicDataStore::<TestRecord>::open(base_dir, None).expect("Failed to open store");
+
+            let retrieved_metadata: Option<TestMetadata> = store.metadata();
+            assert!(retrieved_metadata.is_some());
+
+            let retrieved_metadata = retrieved_metadata.unwrap();
+            assert_eq!(retrieved_metadata, original_metadata);
+            assert_eq!(retrieved_metadata.name, "test");
+            assert_eq!(retrieved_metadata.values.get("key1"), Some(&42));
+            assert_eq!(retrieved_metadata.values.get("key2"), Some(&100));
         }
     }
 }

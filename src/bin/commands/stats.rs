@@ -51,4 +51,3 @@ pub fn run(args: StatsArgs) -> Result<(), HgIndexError> {
 
     Ok(())
 }
-
