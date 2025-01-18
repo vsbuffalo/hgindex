@@ -8,7 +8,7 @@ use hgindex::{BedRecord, InputStream};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::File;
 use std::io::{BufRead, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Args)]
@@ -34,7 +34,7 @@ pub struct PackArgs {
     pub force: bool,
 
     /// Hierarchical binning schema to use
-    #[arg(long, value_enum, default_value_t = hgindex::BinningSchema::Tabix)]
+    #[arg(long, value_enum, default_value_t = hgindex::BinningSchema::Dense)]
     pub schema: hgindex::BinningSchema,
 }
 
@@ -44,9 +44,9 @@ pub fn run(args: PackArgs) -> Result<(), HgIndexError> {
 
     // Create the output path by stemming the path.
     let output_path = args.output.unwrap_or_else(|| {
-        let name = args.input.file_name().unwrap_or_default().to_string_lossy();
-        let name = name.split('.').next().unwrap_or_default();
-        PathBuf::from(name).with_extension("hgidx")
+        let name = args.input.file_stem().unwrap_or_default().to_string_lossy();
+        let parent = args.input.parent().unwrap_or_else(|| Path::new("."));
+        parent.join(name.to_string()).with_extension("hgidx")
     });
 
     // Check if output exists and handle --force
@@ -61,6 +61,7 @@ pub fn run(args: PackArgs) -> Result<(), HgIndexError> {
     );
 
     // Create store
+    eprintln!("Index binning schema: {:?}", args.schema);
     let mut store =
         GenomicDataStore::<BedRecord>::create_with_schema(&output_path, None, &args.schema)?;
 
@@ -150,7 +151,7 @@ pub fn run(args: PackArgs) -> Result<(), HgIndexError> {
         let estimate_diff = (counter as f64 - initial_estimated_records as f64)
             / initial_estimated_records as f64
             * 100.0;
-        eprintln!("\nDevelopment Statistics:");
+        eprintln!("\n--- estimate_total_records() dev stats ---");
         eprintln!("  Estimated records: {}", initial_estimated_records);
         eprintln!("  Actual records:   {}", counter);
         eprintln!("  Estimation off by: {:.1}%", estimate_diff);
@@ -262,6 +263,7 @@ pub fn estimate_total_records(
     // Estimate based on decompressed size
     let estimated_records = (total_decompressed_size as f64 / avg_bytes_per_line) as u64;
 
-    // Add 15% buffer
-    Ok((estimated_records as f64 * 1.15) as u64)
+    // Add a buffer
+    let buffer = 1.05;
+    Ok((estimated_records as f64 * buffer) as u64)
 }

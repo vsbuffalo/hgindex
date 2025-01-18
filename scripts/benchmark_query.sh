@@ -1,5 +1,7 @@
 #!/bin/bash
 
+cargo build --release --features=cli,dev
+
 hyperfine --warmup 10 --min-runs 20  './target/release/hgidx query \
     --regions tests/data/refgene.bed.gz \
     --input tests/data/repeat_masker_autosomes.hgidx \

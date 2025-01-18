@@ -7,6 +7,7 @@ use crate::commands::random_bed;
 //use crate::commands::analyze;
 use crate::commands::pack;
 use crate::commands::query;
+use crate::commands::stats;
 use clap::Parser;
 use hgindex::error::HgIndexError;
 
@@ -28,6 +29,7 @@ enum Commands {
     #[cfg(all(feature = "cli", feature = "dev"))]
     /// Generate a random BED file for benchmarking (only with dev feature)
     RandomBed(random_bed::RandomBedArgs),
+    Stats(stats::StatsArgs),
 }
 
 pub fn run() -> Result<(), HgIndexError> {
@@ -39,6 +41,7 @@ pub fn run() -> Result<(), HgIndexError> {
         Commands::Query(args) => query::run(args),
         #[cfg(feature = "dev")]
         Commands::RandomBed(args) => random_bed::run(args),
+        Commands::Stats(args) => stats::run(args),
     }
 }
 

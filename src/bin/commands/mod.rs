@@ -6,3 +6,5 @@ pub mod pack;
 pub mod query;
 #[cfg(all(feature = "cli", feature = "dev"))]
 pub mod random_bed;
+#[cfg(feature = "cli")]
+pub mod stats;

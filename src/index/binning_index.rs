@@ -65,7 +65,6 @@ pub struct BinningIndex {
     pub sequences: FxHashMap<String, SequenceIndex>,
     last_chrom: Option<String>,
     last_start: Option<u32>,
-    overlap_buffer: Vec<(u64, u64)>,
 }
 
 /// SequenceIndex stores the bin indices to the features they
@@ -76,6 +75,8 @@ pub struct SequenceIndex {
     pub bins: FxHashMap<u32, Vec<Feature>>,
     // Optional linear index for quick region queries
     pub linear_index: Option<LinearIndex>,
+    // Buffer of (offsets, lengths)
+    // overlap_buffer: Vec<(u64, u64)>,
 }
 
 impl Clone for SequenceIndex {
@@ -83,6 +84,7 @@ impl Clone for SequenceIndex {
         Self {
             bins: self.bins.clone(),
             linear_index: self.linear_index.clone(),
+            // overlap_buffer: Vec::with_capacity(130),
         }
     }
 }
@@ -113,6 +115,7 @@ impl<'de> Deserialize<'de> for SequenceIndex {
         Ok(SequenceIndex {
             bins: helper.bins,
             linear_index: helper.linear_index,
+            // overlap_buffer: Vec::with_capacity(130),
         })
     }
 }
@@ -124,7 +127,41 @@ impl SequenceIndex {
         SequenceIndex {
             bins: FxHashMap::default(),
             linear_index,
+            // overlap_buffer: Vec::with_capacity(130),
         }
+    }
+
+    pub fn find_overlapping(
+        &self,
+        bins: &HierarchicalBins,
+        start: u32,
+        end: u32,
+    ) -> Vec<(u64, u64)> {
+        let min_offset = self
+            .linear_index
+            .as_ref()
+            .and_then(|index| index.get_min_offset(start))
+            .unwrap_or(0);
+
+        // Pre-allocate results with an estimate based on bin count
+        let estimated_capacity = bins.region_to_bins(start, end).len() * 10; // Assume ~10 features per bin
+        let mut results = Vec::with_capacity(estimated_capacity);
+
+        for &bin_id in bins.region_to_bins(start, end).iter() {
+            if let Some(features) = self.bins.get(&bin_id) {
+                // SIMD?
+                // Filter features within the bin
+                results.extend(features.iter().filter_map(|feature| {
+                    if feature.index >= min_offset && feature.start < end && feature.end > start {
+                        Some((feature.index, feature.length))
+                    } else {
+                        None
+                    }
+                }));
+            }
+        }
+
+        results
     }
 
     /// Add a feature to the sequence index, ensuring it is in sorted order and updating bins and linear index.
@@ -171,13 +208,13 @@ impl SequenceIndex {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Feature {
     /// Start position.
-    start: u32,
+    pub start: u32,
     /// End position.
-    end: u32,
+    pub end: u32,
     /// The feature index (e.g. a file offset).
-    index: u64,
+    pub index: u64,
     /// The length of data in bytes.
-    length: u64,
+    pub length: u64,
 }
 
 impl Default for BinningIndex {
@@ -195,8 +232,11 @@ impl BinningIndex {
             sequences: FxHashMap::default(),
             last_chrom: None,
             last_start: None,
-            overlap_buffer: Vec::with_capacity(1000),
         }
+    }
+
+    pub fn get_sequence_index(&self, chrom: &str) -> Option<&SequenceIndex> {
+        self.sequences.get(chrom)
     }
 
     pub fn disable_linear_index(&mut self) {
@@ -216,7 +256,8 @@ impl BinningIndex {
     pub fn open(path: &Path) -> std::result::Result<Self, Box<dyn std::error::Error>> {
         let file = File::open(path)?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        Ok(bincode::deserialize(&mmap[..])?)
+        let index: BinningIndex = bincode::deserialize(&mmap[..])?;
+        Ok(index)
     }
 
     /// Add a feature, a range with a file
@@ -241,85 +282,13 @@ impl BinningIndex {
     }
 
     /// Return the indices (e.g. file offsets) of all ranges that overlap with the supplied range.
-    pub fn find_overlapping(&mut self, chrom: &str, start: u32, end: u32) -> &Vec<(u64, u64)> {
-        self.overlap_buffer.clear();
-        // eprintln!("{}", self.has_linear_index());
-        // assert!(self.has_linear_index());
-        let Some(chrom_index) = self.sequences.get(chrom) else {
-            return &self.overlap_buffer;
-        };
-
-        // Determine the minimum offset using the linear index, if available
-        let min_offset = if let Some(linear_index) = &chrom_index.linear_index {
-            linear_index.get_min_offset(start).unwrap_or(u64::MAX)
+    pub fn find_overlapping(&mut self, chrom: &str, start: u32, end: u32) -> Vec<(u64, u64)> {
+        if let Some(chrom_index) = self.sequences.get_mut(chrom) {
+            chrom_index.find_overlapping(&self.bins, start, end)
         } else {
-            0
-        };
-
-        for bin_id in self.bins.region_to_bins(start, end) {
-            if let Some(features) = chrom_index.bins.get(&bin_id) {
-                self.overlap_buffer.extend(
-                    features
-                        .iter()
-                        .filter(|f| f.index >= min_offset && f.start < end && f.end > start)
-                        .map(|f| (f.index, f.length)),
-                );
-            }
+            vec![]
         }
-
-        // self.overlap_buffer.sort_by_key(|f| f.0);
-        &self.overlap_buffer
     }
-
-    // /// Return the indices (e.g. file offsets) of all ranges that overlap with the supplied range.
-    // pub fn find_overlapping(&mut self, chrom: &str, start: u32, end: u32) -> Vec<u64> {
-    //     // eprintln!("{}", self.has_linear_index());
-    //     // assert!(self.has_linear_index());
-    //     let Some(chrom_index) = self.sequences.get(chrom) else {
-    //         return vec![];
-    //     };
-    //
-    //     let binning = HierarchicalBins::default();
-    //     let bins_to_check = binning.region_to_bins(start, end);
-    //
-    //     // Determine the minimum offset using the linear index, if available
-    //     let min_offset = if let Some(linear_index) = &chrom_index.linear_index {
-    //         linear_index.get_min_offset(start).unwrap_or(u64::MAX)
-    //     } else {
-    //         0
-    //     };
-    //
-    //     let mut overlapping = Vec::with_capacity(64);
-    //
-    //     let use_iter = true;
-    //
-    //     if use_iter {
-    //         for bin in self.bins.region_to_bins_iter(start, end) {
-    //             if let Some(features) = chrom_index.bins.get(&bin) {
-    //                 for f in features {
-    //                     if f.index >= min_offset && f.start < end && f.end > start {
-    //                         overlapping.push(f.index);
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     } else {
-    //         // Collect features from the relevant bins
-    //         for bin_id in bins_to_check {
-    //             if let Some(features) = chrom_index.bins.get(&bin_id) {
-    //                 for feature in features {
-    //                     // Check if the feature overlaps the query range
-    //                     if feature.index >= min_offset && feature.start < end && feature.end > start
-    //                     {
-    //                         overlapping.push(feature.index);
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     }
-    //
-    //     overlapping
-    // }
 
     /// Write the BinningIndex to a path by binary serialization.
     pub fn serialize_to_path(
@@ -491,5 +460,22 @@ mod tests {
             results_with_linear.len(),
             results_without_linear.len()
         );
+    }
+
+    #[test]
+    fn test_schema_persistence() {
+        let schema = BinningSchema::Dense;
+        let mut index = BinningIndex::new(&schema);
+        let path = Path::new("test_index.hgidx");
+
+        // Serialize
+        index.serialize_to_path(&path).unwrap();
+
+        // Deserialize
+        let deserialized_index = BinningIndex::open(&path).unwrap();
+        assert_eq!(deserialized_index.bins.schema, schema);
+
+        // Clean up
+        std::fs::remove_file(path).unwrap();
     }
 }

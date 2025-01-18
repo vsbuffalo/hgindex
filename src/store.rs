@@ -242,8 +242,8 @@ impl<T: Record> GenomicDataStore<T> {
 
         let mut count = 0;
         for (offset, length) in offsets {
-            let offset = *offset as usize;
-            let length = *length as usize;
+            let offset = offset as usize;
+            let length = length as usize;
 
             if offset + 8 > mmap.len() {
                 continue;
@@ -295,8 +295,8 @@ impl<T: Record> GenomicDataStore<T> {
         }
 
         for (offset, length) in offsets {
-            let offset = *offset as usize;
-            let length = *length as usize;
+            let offset = offset as usize;
+            let length = length as usize;
 
             if offset + 8 > mmap.len() {
                 continue;
@@ -358,7 +358,7 @@ impl<T: Record> GenomicDataStore<T> {
                 }
             }
         } else {
-            for &(offset, length) in offsets {
+            for (offset, length) in offsets {
                 let offset = offset as usize;
                 let length = length as usize;
                 let record = T::Slice::from_bytes(&mmap[offset + 8..offset + 8 + length]);

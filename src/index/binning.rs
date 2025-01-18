@@ -1,6 +1,7 @@
 #[cfg(feature = "cli")]
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// index/binning.rs
 ///
@@ -129,13 +130,26 @@ pub fn calc_offsets(next_shift: u32, nlevels: usize) -> Vec<u32> {
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Clone)]
 #[cfg_attr(feature = "cli", derive(ValueEnum))]
 pub enum BinningSchema {
+    #[default]
     Tabix,
     TabixNoLinear,
     Ucsc,
     UcscNoLinear,
-    #[default]
     Dense,
     Sparse,
+}
+
+impl fmt::Display for BinningSchema {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BinningSchema::Tabix => write!(f, "Tabix"),
+            BinningSchema::TabixNoLinear => write!(f, "Tabix (No Linear Index)"),
+            BinningSchema::Ucsc => write!(f, "UCSC"),
+            BinningSchema::UcscNoLinear => write!(f, "UCSC (No Linear Index)"),
+            BinningSchema::Dense => write!(f, "Dense"),
+            BinningSchema::Sparse => write!(f, "Sparse"),
+        }
+    }
 }
 
 impl HierarchicalBins {
@@ -159,6 +173,11 @@ impl HierarchicalBins {
     ) -> Self {
         let levels = calc_level_sizes(level_shift, num_levels);
         let bin_offsets = calc_offsets_from_levels(&levels);
+        // TODO: check
+        if base_shift + (num_levels as u32 - 1) * level_shift > 63 {
+            panic!("Shift exceeds maximum allowable bit width!");
+        }
+
         Self {
             schema: schema_type,
             base_shift,

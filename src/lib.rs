@@ -3,6 +3,7 @@ pub mod index;
 #[cfg(feature = "cli")]
 pub mod io;
 pub mod records;
+pub mod stats;
 pub mod store;
 
 pub use index::{BinningIndex, BinningSchema, Feature, HierarchicalBins, SequenceIndex};
