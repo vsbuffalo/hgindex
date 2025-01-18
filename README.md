@@ -23,60 +23,40 @@ masker track as the database, and the UCSC RefGene track as the query:
 
 
 ```
-$ cargo build --release --features=cli,dev && hyperfine --warmup 10 --min-runs 20 \
-  './target/release/hgidx query --regions tests/data/refgene.bed --input tests/data/repeat_masker_autosomes.hgidx > /dev/null' \
-  'tabix tests/data/repeat_masker_autosomes.bed.bgz --regions tests/data/refgene.bed > /dev/null'
-    Finished `release` profile [optimized] target(s) in 0.26s
-Benchmark 1: ./target/release/hgidx query --regions tests/data/refgene.bed --input tests/data/repeat_masker_autosomes.hgidx > /dev/null
-  Time (mean ± σ):     486.3 ms ±  20.5 ms    [User: 415.5 ms, System: 48.2 ms]
-  Range (min … max):   460.7 ms … 551.1 ms    20 runs
+$  bash scripts/benchmark_query.sh
+Benchmark 1: ./target/release/hgidx query \
+    --regions tests/data/refgene.bed.gz \
+    --input tests/data/repeat_masker_autosomes.hgidx \
+    > /dev/null
+  Time (mean ± σ):     486.6 ms ±   3.8 ms    [User: 444.6 ms, System: 36.7 ms]
+  Range (min … max):   480.8 ms … 493.5 ms    20 runs
 
-Benchmark 2: tabix tests/data/repeat_masker_autosomes.bed.bgz --regions tests/data/refgene.bed > /dev/null
-  Time (mean ± σ):      2.772 s ±  0.037 s    [User: 2.633 s, System: 0.066 s]
-  Range (min … max):    2.710 s …  2.859 s    20 runs
-
-Summary
-  ./target/release/hgidx query --regions tests/data/refgene.bed --input tests/data/repeat_masker_autosomes.hgidx > /dev/null ran
-    5.70 ± 0.25 times faster than tabix tests/data/repeat_masker_autosomes.bed.bgz --regions tests/data/refgene.bed > /dev/null
-
-$ ll tests/data/repeat_masker.bed tests/data/repeat_masker.bed.bgz tests/data/repeat_masker.bed.bgz.tbi;\
- du -h tests/data/repeat_masker_autosomes.hgidx
-
--rw-r--r--@ 1 vsb  staff   444M Jan 15 00:16 tests/data/repeat_masker.bed
--rw-r--r--@ 1 vsb  staff   140M Jan 15 01:17 tests/data/repeat_masker.bed.bgz
--rw-r--r--@ 1 vsb  staff   560K Jan 15 01:17 tests/data/repeat_masker.bed.bgz.tbi
-472M	tests/data/repeat_masker_autosomes.hgidx
-
-```
-
-So presently hgindex is about 12x faster than tabix, with about 3.4x the disk
-usage.
-
-Here is an older benchmark for reference, before zero copy deserialization:
-
-```
-$ hyperfine --warmup 3 \
-  './target/release/hgidx  query --regions tests/data/refgene.bed --input tests/data/repeat_masker.hgidx > /dev/null' \
-  'tabix tests/data/repeat_masker.bed.bgz --regions tests/data/refgene.bed > /dev/null'
-    Finished `release` profile [optimized] target(s) in 0.19s
-Benchmark 1: ./target/release/hgidx  query --regions tests/data/refgene.bed --input tests/data/repeat_masker.hgidx > /dev/null
-  Time (mean ± σ):      2.158 s ±  0.015 s    [User: 2.047 s, System: 0.082 s]
-  Range (min … max):    2.140 s …  2.181 s    10 runs
-
-Benchmark 2: tabix tests/data/repeat_masker.bed.bgz --regions tests/data/refgene.bed > /dev/null
-  Time (mean ± σ):      3.920 s ±  0.035 s    [User: 3.785 s, System: 0.091 s]
-  Range (min … max):    3.876 s …  3.991 s    10 runs
+Benchmark 2: tabix \
+    tests/data/repeat_masker_autosomes.bed.bgz \
+    --regions tests/data/refgene.bed.gz \
+    > /dev/null
+  Time (mean ± σ):      2.708 s ±  0.028 s    [User: 2.627 s, System: 0.059 s]
+  Range (min … max):    2.679 s …  2.762 s    20 runs
 
 Summary
-  ./target/release/hgidx  query --regions tests/data/refgene.bed --input tests/data/repeat_masker.hgidx > /dev/null ran
-    1.82 ± 0.02 times faster than tabix tests/data/repeat_masker.bed.bgz --regions tests/data/refgene.bed > /dev/null
+    [hgidx] ran 5.56 ± 0.07 times faster than tabix
 
-$ du -h tests/data/repeat_masker.hgidx
-622M tests/data/repeat_masker.hgidx
+$ bash scripts/compare_sizes.sh
+comparison of data sizes (ratios included):
+-------------------------------------------
+tabix file (.bgz):              144M     1x
+hgidx bins:                     358M	 2.47x
+tabix index (.tbi):             560K     1x
+hgidx index (index.bin):        118M     215.96x
 
-$ du -h tests/data/repeat_masker.bed.bgz
-144M     tests/data/repeat_masker.bed.bgz
 ```
+
+So presently hgindex is about 5.6x faster than tabix, with about 2.5x the disk
+for the binary data. The index, since all ranges are stored in it (rather than
+just block offset ranges), is quite a bit larger (216x) but still small
+enough to load into memory. While index files can get quite large, they are still
+small enough to load in memory (e.g. 100M records of start/end as u32, 8 bytes
+each, would be roughly ≈800MB).
 
 **Warning**: the API and name of this project may change as it is developed.
 Please give feedback, suggestions, and reach out if you'd like to contribute.

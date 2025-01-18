@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 # Source the install script to get DuckDB if needed
@@ -10,16 +9,12 @@ source "${SCRIPT_DIR}/install_duckdb.sh"
 mkdir -p "${SCRIPT_DIR}/../tests/data"
 
 # Run the SQL script using the local DuckDB installation
+# This creates the compressed TSV files from UCSC SQL query.
 "${SCRIPT_DIR}/duckdb/duckdb" < "${SCRIPT_DIR}/repeat_masker.sql"
 
-# Compress repeat masker with bgzip
-if ! command -v bgzip &> /dev/null; then
-    echo "bgzip not found. Please install htslib."
-    exit 1
-fi
+# Since we're already outputting gzipped files, we just need to create bgzip versions
 echo "Preparing test data..."
-bgzip -c "${SCRIPT_DIR}/../tests/data/repeat_masker.bed" > "${SCRIPT_DIR}/../tests/data/repeat_masker.bed.bgz"
+gunzip -c "${SCRIPT_DIR}/../tests/data/repeat_masker.bed.gz" | bgzip -c > "${SCRIPT_DIR}/../tests/data/repeat_masker.bed.bgz"
 tabix -p bed "${SCRIPT_DIR}/../tests/data/repeat_masker.bed.bgz"
 
-
-echo -e "${GREEN}Repeat masker data downloaded successfully${NC}"
+echo "Repeat masker data downloaded successfully"

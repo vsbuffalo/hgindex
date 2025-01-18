@@ -267,6 +267,7 @@ impl BinningIndex {
             }
         }
 
+        // self.overlap_buffer.sort_by_key(|f| f.0);
         &self.overlap_buffer
     }
 

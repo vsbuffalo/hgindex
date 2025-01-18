@@ -45,3 +45,8 @@ opt-level = 3
 opt-level = 3
 inherits = "release"
 debug = true
+
+[[bench]]
+name = "bench"
+harness = false
+required-features = ["cli", "dev"]

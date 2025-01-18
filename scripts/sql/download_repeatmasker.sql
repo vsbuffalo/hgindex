@@ -1,8 +1,6 @@
--- First, install and attach MySQL
 INSTALL mysql;
 ATTACH 'host=genome-mysql.soe.ucsc.edu user=genome' AS ucsc (TYPE mysql);
 
--- Create a temporary table to store the data
 CREATE TEMP TABLE rmsk_temp AS
 SELECT
     genoName AS chrom,
@@ -29,12 +27,10 @@ COPY (
     FROM rmsk_temp
     ORDER BY chrom, genoStart
 )
-TO 'tests/data/repeat_masker.bed'
-WITH (HEADER false, DELIMITER E'\t');
+TO 'tests/data/repeat_masker.bed.gz'
+WITH (HEADER false, DELIMITER E'\t', COMPRESSION 'gzip');
 
--- Write only chr1-chr22 to second file
--- This is for back-compatibility over a bug
--- with branch block-compression
+-- Write only chr1-chr22 to second file (fixed underscore in filename)
 COPY (
     SELECT *
     FROM rmsk_temp
@@ -45,5 +41,5 @@ COPY (
     )
     ORDER BY chrom, genoStart
 )
-TO 'tests/data/repeat_masker_autosomes.bed'
-WITH (HEADER false, DELIMITER E'\t');
+TO 'tests/data/repeat_masker_autosomes.bed.gz'
+WITH (HEADER false, DELIMITER E'\t', COMPRESSION 'gzip');

@@ -67,12 +67,18 @@ impl<'a> RecordSlice<'a> for BedRecordSlice<'a> {
 
         // SAFETY: We've checked the length above, and we know the slices are 4 bytes each
         // u32.
+        //unsafe {
+        //    Self {
+        //        start: u32::from_le_bytes(*(bytes.as_ptr() as *const [u8; 4])),
+        //        end: u32::from_le_bytes(*(bytes[4..].as_ptr() as *const [u8; 4])),
+        //        rest: &bytes[8..],
+        //    }
+        //}
         unsafe {
-            Self {
-                start: u32::from_le_bytes(*(bytes.as_ptr() as *const [u8; 4])),
-                end: u32::from_le_bytes(*(bytes[4..].as_ptr() as *const [u8; 4])),
-                rest: &bytes[8..],
-            }
+            let start = u32::from_le_bytes(*(bytes.get_unchecked(0..4).as_ptr() as *const [u8; 4]));
+            let end = u32::from_le_bytes(*(bytes.get_unchecked(4..8).as_ptr() as *const [u8; 4]));
+            let rest = bytes.get_unchecked(8..);
+            Self { start, end, rest }
         }
     }
 

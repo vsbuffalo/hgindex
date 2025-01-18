@@ -1,3 +1,5 @@
+// store.rs
+
 use std::io;
 use std::{
     collections::HashMap,
@@ -319,15 +321,12 @@ impl<T: Record> GenomicDataStore<T> {
         end: u32,
     ) -> Result<Vec<T::Slice<'a>>, HgIndexError> {
         let mut results = Vec::new();
-
         if end <= start {
             return Err(HgIndexError::InvalidInterval { start, end });
         }
-
         if !self.index.sequences.contains_key(chrom) {
             return Ok(results);
         }
-
         if self.open_chrom_file(chrom).is_err() {
             return Ok(results);
         }
@@ -341,12 +340,30 @@ impl<T: Record> GenomicDataStore<T> {
 
         // Get all overlapping records at once
         let offsets = self.index.find_overlapping(chrom, start, end);
-        for (offset, length) in offsets {
-            let offset = *offset as usize;
-            let length = *length as usize;
 
-            let record = T::Slice::from_bytes(&mmap[offset + 8..offset + 8 + length]);
-            results.push(record);
+        // Pre-allocate to avoid resizing
+        results.reserve(offsets.len());
+
+        // Needs more extensive benchmarking:
+        let chunk = false;
+        if chunk {
+            // Process in chunks to improve cache utilization
+            const CHUNK_SIZE: usize = 32;
+            for chunk in offsets.chunks(CHUNK_SIZE) {
+                for &(offset, length) in chunk {
+                    let offset = offset as usize;
+                    let length = length as usize;
+                    let record = T::Slice::from_bytes(&mmap[offset + 8..offset + 8 + length]);
+                    results.push(record);
+                }
+            }
+        } else {
+            for &(offset, length) in offsets {
+                let offset = offset as usize;
+                let length = length as usize;
+                let record = T::Slice::from_bytes(&mmap[offset + 8..offset + 8 + length]);
+                results.push(record);
+            }
         }
 
         Ok(results)

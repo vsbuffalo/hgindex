@@ -53,6 +53,22 @@ use serde::{Deserialize, Serialize};
 ///  Level 4: needs to start after bin 584   -> starts at 585
 ///
 ///
+///
+/// ## Tuning
+/// Tuning Strategy:
+///
+/// 1. Adjust `base_shift`:
+///    - Decrease for dense small-range queries (e.g., `base_shift = 13`).
+///    - Increase for large-range queries (e.g., `base_shift = 15`).
+/// 2. Modify `level_shift`:
+///    - Decrease for finer level granularity (e.g., `level_shift = 2`).
+///    - Increase for faster bin traversal (e.g., `level_shift = 4`).
+/// 3. Experiment with `num_levels`:
+///    - Fewer levels (e.g., 6): Faster traversal, better for dense data.
+///    - More levels (e.g., 10): Improved flexibility for mixed range sizes.
+/// 4. Optimize `linear_shift`:
+///    - Decrease for clustered dense queries (e.g., `linear_shift = 6`).
+///    - Increase for sparse datasets (e.g., `linear_shift = 10`).
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct HierarchicalBins {
@@ -113,11 +129,11 @@ pub fn calc_offsets(next_shift: u32, nlevels: usize) -> Vec<u32> {
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Clone)]
 #[cfg_attr(feature = "cli", derive(ValueEnum))]
 pub enum BinningSchema {
-    #[default]
     Tabix,
     TabixNoLinear,
     Ucsc,
     UcscNoLinear,
+    #[default]
     Dense,
     Sparse,
 }
@@ -171,7 +187,7 @@ impl HierarchicalBins {
     }
 
     pub fn dense() -> Self {
-        Self::new(BinningSchema::Dense, 14, 2, 6, Some(12))
+        Self::new(BinningSchema::Dense, 14, 3, 10, Some(8))
     }
 
     pub fn sparse() -> Self {
@@ -383,30 +399,43 @@ mod tests {
 
     #[test]
     fn test_region_to_bins() {
-        let index = HierarchicalBins::default();
+        // Test with each schema type
+        for schema in [
+            BinningSchema::Tabix,
+            BinningSchema::Dense,
+            BinningSchema::Sparse,
+            BinningSchema::Ucsc,
+        ] {
+            let index = HierarchicalBins::from_schema(&schema);
 
-        // Test small range within a single smallest bin
-        let bins = index.region_to_bins(1000, 2000);
-        assert!(bins.contains(&585)); // Should contain the level 4 bin
+            // Test small range within a single smallest bin
+            let bins = index.region_to_bins(1000, 2000);
+            let smallest_level_offset = index.bin_offsets[0];
+            assert!(!bins.is_empty());
+            assert!(bins.contains(&smallest_level_offset)); // Should contain a bin from smallest level
 
-        // Test range spanning multiple smallest bins
-        let bins = index.region_to_bins(128 * 1024, 256 * 1024); // Use exact KB boundaries
-        assert!(bins.contains(&(585 + 1))); // Should contain level 4 bins
+            // Test range spanning multiple smallest bins
+            let base_shift = index.base_shift;
+            let bins = index.region_to_bins(1 << base_shift, 2 << base_shift); // Span exactly 2 bins
+            assert!(bins.len() >= 2); // Should contain at least 2 bins
 
-        // Test larger range that requires checking multiple levels
-        let bins = index.region_to_bins(0, 1_000_000);
-        // Should contain bins from appropriate levels based on range size
-        assert!(bins.iter().any(|&x| x >= 73)); // Should have level 3 bins
-        assert!(bins.iter().any(|&x| x >= 585)); // Should have level 4 bins
+            // Test larger range that requires checking multiple levels
+            let bins = index.region_to_bins(0, 1_000_000);
+            // Should have bins from multiple levels
+            let level_3_start = index.bin_offsets[index.bin_offsets.len() - 2];
+            let level_4_start = index.bin_offsets[index.bin_offsets.len() - 1];
+            assert!(bins.iter().any(|&x| x >= level_3_start)); // Should have higher level bins
+            assert!(bins.iter().any(|&x| x >= level_4_start)); // Should have lower level bins
 
-        // Test exact bin boundary
-        let bins = index.region_to_bins(0, 128 * 1024); // Exactly one 128kb bin
-        assert!(bins.contains(&585)); // Should contain first level 4 bin
+            // Test exact bin boundary
+            let bins = index.region_to_bins(0, 1 << base_shift); // Exactly one smallest bin
+            assert!(bins.contains(&smallest_level_offset)); // Should contain first bin
 
-        // Test that bins are unique
-        let bins = index.region_to_bins(0, 10_000_000);
-        let unique_bins: HashSet<_> = bins.iter().cloned().collect();
-        assert_eq!(bins.len(), unique_bins.len());
+            // Test that bins are unique
+            let bins = index.region_to_bins(0, 10_000_000);
+            let unique_bins: HashSet<_> = bins.iter().cloned().collect();
+            assert_eq!(bins.len(), unique_bins.len());
+        }
     }
 
     fn test_with_all_configs<F>(test_fn: F)

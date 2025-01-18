@@ -20,5 +20,5 @@ COPY (
     FROM ucsc.hg38.refGene
     ORDER BY chrom, txStart  -- Sort by chromosome and start position
 )
-TO 'tests/data/refgene.bed'
-WITH (HEADER false, DELIMITER E'\t');
+TO 'tests/data/refgene.bed.gz'
+WITH (HEADER false, DELIMITER E'\t', COMPRESSION 'gzip');

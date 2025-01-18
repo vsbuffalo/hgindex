@@ -70,3 +70,15 @@ impl From<String> for HgIndexError {
         HgIndexError::StringError(error)
     }
 }
+
+#[cfg(feature = "cli")]
+impl From<crate::io::IoError> for HgIndexError {
+    fn from(error: crate::io::IoError) -> Self {
+        match error {
+            crate::io::IoError::IoError(e) => HgIndexError::IOError(e),
+            crate::io::IoError::InvalidGzipHeader => {
+                HgIndexError::StringError("Invalid gzip header".into())
+            }
+        }
+    }
+}

@@ -30,29 +30,48 @@ impl InputStream {
         }
     }
 
-    fn is_gzipped(file: &mut File) -> Result<bool, IoError> {
+    pub fn is_gzipped(&self) -> Result<bool, IoError> {
+        let mut file = File::open(&self.filepath)?;
         let mut header = [0u8; 2];
-        // Read the first two bytes
         file.read_exact(&mut header)?;
-        // Reset the file pointer
         file.rewind()?;
         Ok(header == GZIP_MAGIC)
     }
 
-    pub fn reader(&self) -> Result<BufReader<Box<dyn Read>>, IoError> {
-        let mut file = File::open(&self.filepath)?;
-        let reader: Box<dyn Read> = if Self::is_gzipped(&mut file)? {
+    pub fn buffered_reader(&self) -> Result<BufReader<Box<dyn Read>>, IoError> {
+        let file = File::open(&self.filepath)?;
+        let reader: Box<dyn Read> = if self.is_gzipped()? {
             Box::new(GzDecoder::new(file))
         } else {
             Box::new(file)
         };
-        Ok(BufReader::with_capacity(DEFAULT_BUFFER_SIZE, reader))
+
+        let mut buf_reader = BufReader::with_capacity(DEFAULT_BUFFER_SIZE, reader);
+
+        // Peek at the first few bytes to debug the stream
+        let mut preview = [0u8; 100];
+        let _bytes_read = buf_reader.read(&mut preview)?;
+        // eprintln!( "Debug: First {} bytes of stream: {:?}", peek_size, String::from_utf8_lossy(&preview[..peek_size]));
+        Ok(buf_reader)
+    }
+
+    pub fn reader(&self) -> Result<Box<dyn Read>, IoError> {
+        let file = File::open(&self.filepath)?;
+        let reader: Box<dyn Read> = if self.is_gzipped()? {
+            Box::new(GzDecoder::new(file))
+        } else {
+            Box::new(file)
+        };
+        Ok(reader) // Return Box<dyn Read> directly
     }
 
     pub fn has_header(&self, expect: &str) -> Result<bool, IoError> {
-        let mut buf_reader = self.reader()?;
+        // Wrap the `Box<dyn Read>` in a `BufReader`
+        let reader = self.reader()?;
+        let mut buf_reader = BufReader::new(reader);
+
         let mut first_line = String::new();
-        buf_reader.read_line(&mut first_line)?;
+        buf_reader.read_line(&mut first_line)?; // `read_line` now works
         Ok(first_line.starts_with(expect))
     }
 }

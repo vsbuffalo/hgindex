@@ -1,7 +1,6 @@
 // bin/commands/query.rs
 
 use clap::Args;
-use csv::ReaderBuilder;
 use flate2::Compression;
 use hgindex::error::HgIndexError;
 use hgindex::io::OutputStream;
@@ -9,15 +8,20 @@ use hgindex::store::GenomicDataStore;
 use hgindex::{BedRecord, BedRecordSlice};
 use itoa;
 use std::fs;
-use std::fs::File;
 use std::path::PathBuf;
 use std::time::Instant;
+
+use crate::commands::pack::build_tsv_reader;
 
 #[derive(Args)]
 pub struct QueryArgs {
     /// Output file.
     #[arg(short, long, value_name = "overlaps.bed")]
     pub output: Option<String>,
+
+    /// Comment character to skip lines starting with this
+    #[arg(long, default_value = "#")]
+    pub comment: char,
 
     /// The query region, in the format seqname:start-end where start and end are
     /// 1-based inclusive coordinates (like tabix's region argument).
@@ -74,7 +78,7 @@ pub fn run(args: QueryArgs) -> Result<(), HgIndexError> {
             regions_file.display(),
             input_path.display()
         );
-        query_bed_regions(&mut store, &regions_file, &mut output_writer)?;
+        query_bed_regions(&mut store, &regions_file, &mut output_writer, &args.comment)?;
     }
 
     let duration = duration_start.elapsed();
@@ -90,8 +94,8 @@ fn query_single_region<W: std::io::Write>(
     let (seqname, start, end) = parse_region(region)?;
 
     // Use `map_overlapping` for efficient ZCD
-    let record_count = store.map_overlapping(&seqname, start, end, |record_slice| {
-        write_tsv_bytes(&seqname, &record_slice, output_writer)?;
+    let record_count = store.map_overlapping(seqname, start, end, |record_slice| {
+        write_tsv_bytes(seqname, &record_slice, output_writer)?;
         Ok(())
     })?;
 
@@ -103,12 +107,14 @@ fn query_bed_regions<W: std::io::Write>(
     store: &mut GenomicDataStore<BedRecord>,
     regions_file: &PathBuf,
     output_writer: &mut W,
+    comment_char: &char,
 ) -> Result<(), HgIndexError> {
-    let mut reader = ReaderBuilder::new()
-        .delimiter(b'\t')
-        .has_headers(false)
-        .comment(Some(b'#'))
-        .from_reader(File::open(regions_file)?);
+    let mut reader = build_tsv_reader(
+        regions_file,
+        Some(*comment_char as u8),
+        true,  // flexible
+        false, // has_headers
+    )?;
 
     let mut total_records = 0;
     // Initialize batch with reasonable starting capacity

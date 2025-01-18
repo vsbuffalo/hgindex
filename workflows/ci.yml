@@ -54,3 +54,12 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy -- -D warnings
+
+      - name: Run benchmark
+        run: cargo bench
+      - uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: 'criterion'  # Tells it to expect Criterion format
+          output-file-path: target/criterion/genomic_queries/report/index.html
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true  # Automatically pushes results to gh-pages branch
